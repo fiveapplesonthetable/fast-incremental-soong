@@ -1,0 +1,2090 @@
+From 45656a900a24eeffc15ff813b72b21653ea1b9a4 Mon Sep 17 00:00:00 2001
+From: Zimuzo Ezeozue <zezeozue@google.com>
+Date: Sat, 30 May 2026 14:40:16 +0000
+Subject: [PATCH] =?UTF-8?q?soong:=20resident=20warm-incremental=20build=20?=
+ =?UTF-8?q?=E2=80=94=20O(edit)=20ninja=20generation=20+=20warm=20add?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Resident soong_build server (SOONG_PERSISTENT_REUSE_GRAPH=true) keeping the
+resolved+mutated graph and caches in RAM across builds, with changed-file-only
+reparse and the warm add/remove wiring. A warm edit reparses only the changed
+.bp files, re-mutates only the affected closure, regenerates only dirty modules,
+and delta-writes only the shards that changed.
+
+Measured on real AOSP (aosp_cf_x86_64_phone-trunk_staging-userdebug), all
+byte-identical to a cold rebuild (cmp, 403/403 shards):
+  - property edit (services.core.unboosted): analysis 131s -> 4.4s
+  - add a module: warm, 1 of 50 shards rewritten, ~34s wall (was a crash/fallback)
+  - remove a module: falls back to a correct full rebuild (name interface has no
+    ModuleRemover; next step)
+
+Includes: BeginIncrementalBuild before DiffParsedModules (nil-map crash fix);
+changed-file-only reparse with full-reparse fallback; add/remove routed through
+IncrementalAddModules/Remove with fallback. Local/experimental.
+
+Change-Id: Id5fffb376513e3028b76af007f85b687bd351126
+---
+ android/namespace.go               |  13 +
+ android/phony.go                   | 186 ++++++++------
+ android/singleton.go               |  10 +
+ android/singleton_module.go        |  11 +
+ cmd/soong_build/Android.bp         |   1 +
+ cmd/soong_build/main.go            | 348 +++++++++++++++++++++++++-
+ cmd/soong_build/persistent.go      | 329 +++++++++++++++++++++++++
+ docs/incremental_soong_tutorial.md | 343 ++++++++++++++++++++++++++
+ docs/resident_incremental_build.md | 380 +++++++++++++++++++++++++++++
+ ui/build/config.go                 |   5 +
+ ui/build/ninja.go                  |  10 +
+ ui/build/ninja_resident.go         | 120 +++++++++
+ ui/build/soong.go                  |  41 ++++
+ 13 files changed, 1710 insertions(+), 87 deletions(-)
+ create mode 100644 cmd/soong_build/persistent.go
+ create mode 100644 docs/incremental_soong_tutorial.md
+ create mode 100644 docs/resident_incremental_build.md
+ create mode 100644 ui/build/ninja_resident.go
+
+diff --git a/android/namespace.go b/android/namespace.go
+index 7d2ace2ca..17dcf9252 100644
+--- a/android/namespace.go
++++ b/android/namespace.go
+@@ -233,6 +233,19 @@ func (r *NameResolver) NewModule(ctx blueprint.NamespaceContext, moduleGroup blu
+ 	return ns, nil
+ }
+ 
++// RemoveModule implements the optional blueprint.ModuleRemover interface so the
++// resident incremental-remove path (IncrementalRemoveModules) can drop a deleted
++// module from the name index without a full rebuild. The bare name is unique within
++// a namespace, so removing it from every namespace's container drops the one that
++// holds it and is a no-op everywhere else.
++func (r *NameResolver) RemoveModule(name string) {
++	for _, namespace := range r.sortedNamespaces.sortedItems() {
++		if remover, ok := namespace.moduleContainer.(blueprint.ModuleRemover); ok {
++			remover.RemoveModule(name)
++		}
++	}
++}
++
+ func (r *NameResolver) NewSkippedModule(ctx blueprint.NamespaceContext, name string, skipInfo blueprint.SkippedModuleInfo) {
+ 	r.rootNamespace.moduleContainer.NewSkippedModule(ctx, name, skipInfo)
+ }
+diff --git a/android/phony.go b/android/phony.go
+index 105477a05..76af9a615 100644
+--- a/android/phony.go
++++ b/android/phony.go
+@@ -16,6 +16,7 @@ package android
+ 
+ import (
+ 	"fmt"
++	"hash/fnv"
+ 	"runtime"
+ 	"sort"
+ 	"strings"
+@@ -46,102 +47,139 @@ type phonySingleton struct {
+ 
+ var _ SingletonMakeVarsProvider = (*phonySingleton)(nil)
+ 
++// phonyMkShards is the number of files the soong-only phony makefile is sharded
++// into (soong_phony_targets.N.mk). A stable hash of each phony key picks its shard,
++// so a warm add rewrites only the shards whose keys changed instead of the whole
++// (multi-hundred-MB) file. Fixed so warm and cold agree.
++const phonyMkShards = 64
++
++func phonyMkShardOf(key string) int {
++	h := fnv.New64a()
++	h.Write([]byte(key))
++	return int(h.Sum64() % phonyMkShards)
++}
++
+ func (p *phonySingleton) GenerateBuildActions(ctx SingletonContext) {
+-	p.phonyMap = make(phonyMap)
+-	ctx.VisitAllModuleProxies(func(m ModuleProxy) {
+-		if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
+-			for k, v := range info.Phonies {
+-				p.phonyMap[k] = append(p.phonyMap[k], v...)
++	// touchedShards is the set of output .mk shards whose content changed this build.
++	// On a pure add only the shards holding a newly-added module's phony keys change,
++	// so only those are rebuilt and rewritten; the rest are kept on disk. On a full
++	// build every shard is (re)written.
++	touchedShards := map[int]bool{}
++
++	if ctx.IncrementalPureAdd() && p.phonyMap != nil {
++		// Fold: keep the cached, already-sorted phonyMap from the previous build and
++		// merge in only the modules added this build, re-sorting only the keys they
++		// touch. Avoids re-reading all ~14k modules' providers and re-sorting all keys.
++		ctx.VisitAddedModuleProxies(func(m ModuleProxy) {
++			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
++				for k, v := range info.Phonies {
++					p.phonyMap[k] = SortedUniquePaths(append(p.phonyMap[k], v...))
++					touchedShards[phonyMkShardOf(k)] = true
++				}
+ 			}
++		})
++		p.phonyList = make([]string, 0, len(p.phonyMap))
++		for phony := range p.phonyMap {
++			p.phonyList = append(p.phonyList, phony)
+ 		}
+-	})
++		sort.Strings(p.phonyList)
++	} else {
++		p.phonyMap = make(phonyMap)
++		ctx.VisitAllModuleProxies(func(m ModuleProxy) {
++			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
++				for k, v := range info.Phonies {
++					p.phonyMap[k] = append(p.phonyMap[k], v...)
++				}
++			}
++		})
+ 
+-	ctx.VisitAllSingletons(func(s blueprint.SingletonProxy) {
+-		if info, ok := OtherSingletonProvider(ctx, s, SingletonPhonyProvider); ok {
+-			for k, v := range info.Phonies {
+-				p.phonyMap[k] = append(p.phonyMap[k], v...)
++		ctx.VisitAllSingletons(func(s blueprint.SingletonProxy) {
++			if info, ok := OtherSingletonProvider(ctx, s, SingletonPhonyProvider); ok {
++				for k, v := range info.Phonies {
++					p.phonyMap[k] = append(p.phonyMap[k], v...)
++				}
+ 			}
+-		}
+-	})
++		})
+ 
+-	// We will sort phonyList in parallel with other stuff later, but for now copy it into
+-	// a slice in series so that we don't read and write to phonyMap concurrently.
+-	p.phonyList = make([]string, 0, len(p.phonyMap))
+-	for phony := range p.phonyMap {
+-		p.phonyList = append(p.phonyList, phony)
+-	}
++		// We will sort phonyList in parallel with other stuff later, but for now copy it
++		// into a slice in series so that we don't read and write to phonyMap concurrently.
++		p.phonyList = make([]string, 0, len(p.phonyMap))
++		for phony := range p.phonyMap {
++			p.phonyList = append(p.phonyList, phony)
++		}
+ 
+-	type phonyDef struct {
+-		name string
+-		deps Paths
+-	}
++		type phonyDef struct {
++			name string
++			deps Paths
++		}
+ 
+-	sortChan := make(chan phonyDef, len(p.phonyMap))
+-	resultsChan := make(chan phonyDef)
+-	var wg sync.WaitGroup
++		sortChan := make(chan phonyDef, len(p.phonyMap))
++		resultsChan := make(chan phonyDef)
++		var wg sync.WaitGroup
++
++		// Sorting the phony deps in parallel saves about 2 seconds. Nothing runs in
++		// parallel with the phony singleton so it's time off of wall clock.
++		for i := 0; i < 2*runtime.NumCPU(); i++ {
++			wg.Add(1)
++			go func() {
++				for toSort := range sortChan {
++					toSort.deps = SortedUniquePaths(toSort.deps)
++					resultsChan <- toSort
++				}
++				wg.Done()
++			}()
++		}
+ 
+-	// Sorting the phony deps in parallel saves about 2 seconds. Nothing runs in parallel with
+-	// the phony singleton so it's time off of wall clock.
+-	for i := 0; i < 2*runtime.NumCPU(); i++ {
+-		wg.Add(1)
+ 		go func() {
+-			for toSort := range sortChan {
+-				toSort.deps = SortedUniquePaths(toSort.deps)
+-				resultsChan <- toSort
+-			}
+-			wg.Done()
++			sort.Strings(p.phonyList)
++			wg.Wait()
++			close(resultsChan)
+ 		}()
+-	}
+ 
+-	go func() {
+-		sort.Strings(p.phonyList)
+-		wg.Wait()
+-		close(resultsChan)
+-	}()
+-
+-	for phony, deps := range p.phonyMap {
+-		sortChan <- phonyDef{
+-			name: phony,
+-			deps: deps,
++		for phony, deps := range p.phonyMap {
++			sortChan <- phonyDef{name: phony, deps: deps}
+ 		}
+-	}
+-	close(sortChan)
++		close(sortChan)
+ 
+-	for result := range resultsChan {
+-		p.phonyMap[result.name] = result.deps
++		for result := range resultsChan {
++			p.phonyMap[result.name] = result.deps
++		}
++
++		for i := 0; i < phonyMkShards; i++ {
++			touchedShards[i] = true
++		}
+ 	}
+ 
+ 	if !ctx.Config().KatiEnabled() {
+-		// In soong-only builds, the phonies can conflict with dist targets that will
+-		// be generated in the packaging step. Instead of emitting a blueprint/ninja phony directly,
+-		// create a makefile that defines the phonies that will be included in the packaging step.
+-		// Make will dedup the phonies there.
+-		phonyFileSize := 0
++		// In soong-only builds, the phonies can conflict with dist targets that will be
++		// generated in the packaging step. Instead of emitting a ninja phony directly,
++		// write a makefile (included by build/make/packaging/main_soong_only.mk, which
++		// globs soong_phony_targets.*.mk). Sharded by phonyMkShardOf so a warm add only
++		// rewrites the shards whose keys changed; deterministic, so warm == cold.
++		shardKeys := make([][]string, phonyMkShards)
+ 		for _, phony := range p.phonyList {
+-			phonyFileSize += 2*len(phony) + 11
+-			for _, dep := range p.phonyMap[phony] {
+-				phonyFileSize += len(dep.String()) + 1
++			s := phonyMkShardOf(phony)
++			if touchedShards[s] {
++				shardKeys[s] = append(shardKeys[s], phony)
+ 			}
+ 		}
+-		var buildPhonyFileContents strings.Builder
+-		buildPhonyFileContents.Grow(phonyFileSize)
+-		for _, phony := range p.phonyList {
+-			buildPhonyFileContents.WriteString(".PHONY: ")
+-			buildPhonyFileContents.WriteString(phony)
+-			buildPhonyFileContents.WriteString("\n")
+-			buildPhonyFileContents.WriteString(phony)
+-			buildPhonyFileContents.WriteString(":")
+-			for _, dep := range p.phonyMap[phony] {
+-				buildPhonyFileContents.WriteString(" ")
+-				buildPhonyFileContents.WriteString(dep.String())
++		for s := range touchedShards {
++			var b strings.Builder
++			for _, phony := range shardKeys[s] {
++				b.WriteString(".PHONY: ")
++				b.WriteString(phony)
++				b.WriteString("\n")
++				b.WriteString(phony)
++				b.WriteString(":")
++				for _, dep := range p.phonyMap[phony] {
++					b.WriteString(" ")
++					b.WriteString(dep.String())
++				}
++				b.WriteString("\n")
+ 			}
+-			buildPhonyFileContents.WriteString("\n")
+-		}
+-		if buildPhonyFileContents.Len() != phonyFileSize {
+-			panic(fmt.Sprintf("phonyFileSize calculation incorrect, expected %d, actual len: %d", phonyFileSize, buildPhonyFileContents.Len()))
++			f := PathForOutput(ctx, fmt.Sprintf("soong_phony_targets.%d.mk", s))
++			writeValueIfChanged(ctx, absolutePath(f.String()), b.String())
+ 		}
+-		buildPhonyFile := PathForOutput(ctx, "soong_phony_targets.mk")
+-		writeValueIfChanged(ctx, absolutePath(buildPhonyFile.String()), buildPhonyFileContents.String())
+ 	}
+ }
+ 
+diff --git a/android/singleton.go b/android/singleton.go
+index 97e561466..f95a2310c 100644
+--- a/android/singleton.go
++++ b/android/singleton.go
+@@ -87,6 +87,8 @@ type SingletonContext interface {
+ 	VisitAllModulesBlueprint(visit func(blueprint.Module))
+ 	VisitAllModules(visit func(Module))
+ 	VisitAllModuleProxies(visit func(proxy ModuleProxy))
++	VisitAddedModuleProxies(visit func(proxy ModuleProxy))
++	IncrementalPureAdd() bool
+ 	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
+ 	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
+ 
+@@ -358,6 +360,14 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
+ 	s.SingletonContext.VisitAllModuleProxies(visitProxyAdaptor(visit))
+ }
+ 
++func (s *singletonContextAdaptor) VisitAddedModuleProxies(visit func(proxy ModuleProxy)) {
++	s.SingletonContext.VisitAddedModuleProxies(visitProxyAdaptor(visit))
++}
++
++func (s *singletonContextAdaptor) IncrementalPureAdd() bool {
++	return s.SingletonContext.IncrementalPureAdd()
++}
++
+ func (s *singletonContextAdaptor) VisitAllModulesOrProxies(visit func(ModuleOrProxy)) {
+ 	s.SingletonContext.VisitAllModulesOrProxies(func(module blueprint.ModuleOrProxy) {
+ 		visit(module)
+diff --git a/android/singleton_module.go b/android/singleton_module.go
+index 43028e857..c996f0b32 100644
+--- a/android/singleton_module.go
++++ b/android/singleton_module.go
+@@ -76,6 +76,17 @@ func (smb *SingletonModuleBase) GenerateBuildActions(ctx blueprint.ModuleContext
+ 	smb.ModuleBase.GenerateBuildActions(ctx)
+ }
+ 
++// ResetBuildActionsState clears the single-variant guard so that the resident
++// graph-residency path (which re-runs GenerateBuildActions on the same shared
++// SingletonModule instance) does not falsely report multiple variants. Called by
++// blueprint's ResetBuildActionsForReanalysis. The bp field is intentionally kept
++// (it is set at load time, not during generate).
++func (smb *SingletonModuleBase) ResetBuildActionsState() {
++	smb.lock.Lock()
++	smb.variant = ""
++	smb.lock.Unlock()
++}
++
+ // InitAndroidSingletonModule must be called from the SingletonModule's factory function to
+ // initialize SingletonModuleBase.
+ func InitAndroidSingletonModule(sm SingletonModule) {
+diff --git a/cmd/soong_build/Android.bp b/cmd/soong_build/Android.bp
+index 9265637ab..680d132fd 100644
+--- a/cmd/soong_build/Android.bp
++++ b/cmd/soong_build/Android.bp
+@@ -37,6 +37,7 @@ blueprint_go_binary {
+     ],
+     srcs: [
+         "main.go",
++        "persistent.go",
+         "writedocs.go",
+     ],
+     primaryBuilder: true,
+diff --git a/cmd/soong_build/main.go b/cmd/soong_build/main.go
+index 254dd25cc..53123f3a0 100644
+--- a/cmd/soong_build/main.go
++++ b/cmd/soong_build/main.go
+@@ -20,8 +20,10 @@ import (
+ 	"flag"
+ 	"fmt"
+ 	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -47,6 +49,12 @@ var (
+ 	delveListen string
+ 	delvePath   string
+ 
++	// persistentListen, when non-empty, makes soong_build run as a resident
++	// server listening on the given unix socket path instead of performing a
++	// single analysis and exiting. Off by default; opted into by soong_ui only
++	// when SOONG_PERSISTENT=true.
++	persistentListen string
++
+ 	cmdlineArgs android.CmdArgs
+ )
+ 
+@@ -59,6 +67,24 @@ type ConfigCache struct {
+ }
+ 
+ func init() {
++	// The --persistent flag only makes sense on the real command line, not in a
++	// per-request re-parse, so register it directly on flag.CommandLine.
++	flag.StringVar(&persistentListen, "persistent", "", "run as a resident server on the given unix socket path")
++
++	registerFlags(flag.CommandLine)
++
++	// Disable deterministic randomization in the protobuf package, so incremental
++	// builds with unrelated Soong changes don't trigger large rebuilds (since we
++	// write out text protos in command lines, and command line changes trigger
++	// rebuilds).
++	androidProtobuf.DisableRand()
++}
++
++// registerFlags registers all of soong_build's per-build flags onto fs. It is
++// called once on flag.CommandLine for normal runs, and once per request on a
++// fresh FlagSet in persistent mode so that flag values do not leak between
++// builds (a fresh FlagSet resets every bound variable to its default).
++func registerFlags(flag *flag.FlagSet) {
+ 	// Flags that make sense in every mode
+ 	flag.StringVar(&topDir, "top", "", "Top directory of the Android source tree")
+ 	flag.StringVar(&cmdlineArgs.SoongOutDir, "soong_out", "", "Soong output directory (usually $TOP/out/soong)")
+@@ -90,12 +116,6 @@ func init() {
+ 	flag.BoolVar(&cmdlineArgs.RunGoTests, "t", false, "build and run go tests during bootstrap")
+ 	flag.BoolVar(&cmdlineArgs.IncrementalBuildActions, "incremental-build-actions", false, "generate build actions incrementally")
+ 	flag.StringVar(&cmdlineArgs.IncrementalDebugFile, "incremental-debug-file", "", "incremental debug file")
+-
+-	// Disable deterministic randomization in the protobuf package, so incremental
+-	// builds with unrelated Soong changes don't trigger large rebuilds (since we
+-	// write out text protos in command lines, and command line changes trigger
+-	// rebuilds).
+-	androidProtobuf.DisableRand()
+ }
+ 
+ func newNameResolver(config android.Config) *android.NameResolver {
+@@ -317,11 +337,41 @@ func main() {
+ 		// Disable collection of memory profiles if we won't save one to disk.
+ 		runtime.MemProfileRate = 0
+ 	}
+-	soongStartTime := time.Now()
++
++	// Persistent (resident) mode. When soong_ui opts a build into persistent
++	// mode it sets SOONG_PERSISTENT_SOCK; this short-lived process then acts as a
++	// thin client and forwards the build to the resident server (see
++	// persistent.go), keeping the heavy analysis process warm between builds.
++	if sock := os.Getenv(persistentSockEnv); sock != "" && persistentListen == "" {
++		runPersistentClient(sock)
++		return
++	}
+ 
+ 	shared.ReexecWithDelveMaybe(delveListen, delvePath)
+ 	android.InitSandbox(topDir)
+ 
++	if persistentListen != "" {
++		runPersistentServer(persistentListen)
++		return
++	}
++
++	runBuild()
++}
++
++// runBuild performs a single soong_build analysis pass and writes the ninja
++// file. In normal mode it is invoked once from main(); in persistent mode it is
++// invoked once per request, after the request's flags and environment have been
++// re-parsed into the package globals (see persistent.go).
++func runBuild() {
++	soongStartTime := time.Now()
++
++	// Graph-residency fast path (Phase 2, experimental): if we have a resolved
++	// graph from a previous build, reuse it and skip parse + ResolveDependencies.
++	if reuseGraphMode && residentBuildCtx != nil {
++		runBuildReuse(soongStartTime)
++		return
++	}
++
+ 	availableEnv := parseAvailableEnv()
+ 	configuration, err := android.NewConfig(cmdlineArgs, availableEnv)
+ 	maybeQuit(err, "")
+@@ -336,19 +386,39 @@ func main() {
+ 	ctx := newContext(configuration)
+ 	android.StartBackgroundMetrics(configuration)
+ 
++	if reuseGraphMode {
++		// Keep a pristine pre-generate snapshot of every module so the resident
++		// server can re-run build-action generation on this graph for later builds.
++		ctx.SetKeepPristineModules(true)
++	}
++
+ 	var configCache *ConfigCache
+ 	configFile := filepath.Join(topDir, ctx.Config().OutDir(), configCacheFile)
+ 	incremental := false
+-	// Tie incremental analysis to soong-only for now.
+-	ctx.SetIncrementalEnabled(cmdlineArgs.IncrementalBuildActions && !cmdlineArgs.KatiEnabled)
+-	if ctx.GetIncrementalEnabled() {
+-		configCache, incremental = incrementalValid(ctx.Config(), configFile)
++	if residentCache != nil {
++		// Persistent (resident) mode: use the process-resident in-memory action
++		// cache instead of the on-disk one. It is populated by the first build
++		// after the server starts (analysis=false) and reused via cache hits by
++		// subsequent builds (analysis=true), with no multi-GB on-disk cache and
++		// no per-build re-open. Changed modules miss and regenerate, so output is
++		// equivalent to a one-shot incremental build.
++		ctx.SetIncrementalEnabled(true)
++		ctx.SetIncrementalAnalysis(residentReqCount > 0)
++		ctx.SetBuildActionCache(residentCache)
++		residentReqCount++
++	} else {
++		// Tie incremental analysis to soong-only for now.
++		ctx.SetIncrementalEnabled(cmdlineArgs.IncrementalBuildActions && !cmdlineArgs.KatiEnabled)
++		if ctx.GetIncrementalEnabled() {
++			configCache, incremental = incrementalValid(ctx.Config(), configFile)
++		}
++		ctx.SetIncrementalAnalysis(incremental)
+ 	}
+-	ctx.SetIncrementalAnalysis(incremental)
+ 	ctx.SetIncrementalDebugFile(cmdlineArgs.IncrementalDebugFile)
+ 
+ 	ctx.Register()
+ 	finalOutputFile, ninjaDeps := runSoongOnlyBuild(ctx)
++	runBpgenTakeoverAfterSoong(configuration)
+ 
+ 	ninjaDeps = append(ninjaDeps, configuration.ProductVariablesFileName)
+ 	ninjaDeps = append(ninjaDeps, usedEnvFile)
+@@ -360,7 +430,10 @@ func main() {
+ 
+ 	writeDepFile(finalOutputFile, ctx.EventHandler, ninjaDeps)
+ 
+-	if ctx.GetIncrementalEnabled() {
++	// The on-disk config cache is only used by the on-disk incremental path; in
++	// resident mode incremental validity is tracked in-process (residentReqCount)
++	// and configCache is nil, so skip it.
++	if ctx.GetIncrementalEnabled() && residentCache == nil {
+ 		data, err := shared.EnvFileContents(configuration.EnvDeps())
+ 		maybeQuit(err, "")
+ 		configCache.EnvDepsHash, err = proptools.CalculateHash(data)
+@@ -380,6 +453,255 @@ func main() {
+ 	// are ninja inputs to the main output file, then ninja would superfluously
+ 	// rebuild this output file on the next build invocation.
+ 	touch(shared.JoinPath(topDir, finalOutputFile))
++
++	// In graph-residency mode, keep this fully-resolved Context so the next build
++	// can reuse it (see runBuildReuse), and capture each module's post-generate
++	// provider interface so incremental re-mutation can propagate exported changes.
++	if reuseGraphMode {
++		ctx.SnapshotInterfaceHashes()
++		residentBuildCtx = ctx
++		fmt.Fprintf(os.Stderr, "soong_build persistent: graph-residency: stored resolved graph (dependenciesReady=%v); next build will skip parse+resolve\n", ctx.DependenciesReady())
++	}
++}
++
++// runBuildReuse is the EXPERIMENTAL graph-residency fast path (Phase 2). It
++// reuses the resolved+mutated Context from the previous build (residentBuildCtx),
++// skipping list_modules + parse_bp + ResolveDependencies (the ~40s O(whole-tree)
++// phases) and only re-generating build actions and rewriting the ninja file.
++//
++// EXPERIMENTAL/INCOMPLETE: it does not re-parse changed Android.bp files or
++// re-run mutators (see blueprint.Context.ResetBuildActionsForReanalysis), so the
++// regenerated actions reflect the property state of the last full analysis. It
++// is for measuring the graph-residency ceiling and developing the incremental
++// re-mutation path; it is NOT yet correct for arbitrary edits.
++func runBuildReuse(soongStartTime time.Time) {
++	ctx := residentBuildCtx
++	configuration := ctx.Config()
++	metricsDir := parseAvailableEnv()["LOG_DIR"]
++
++	// The EventHandler on the resident Context accumulates events across builds;
++	// clear the previous build's events so this build's metrics don't collide
++	// (CompletedEvents panics on duplicate event ids).
++	ctx.EventHandler.Reset()
++
++	// Start a fresh background metrics collector for this build. writeMetrics ->
++	// collectMetrics sends on perfCollector.stop, which deadlocks without a live
++	// collector goroutine (the previous build's collector already stopped).
++	android.StartBackgroundMetrics(configuration)
++
++	fullRebuild := func(reason string) {
++		fmt.Fprintf(os.Stderr, "soong_build persistent: incremental fallback (%s) -> full rebuild\n", reason)
++		residentBuildCtx = nil // discard the resident graph; runBuild does a cold build
++		runBuild()
++	}
++
++	// Re-parse the source tree into a throwaway context (parse only, pre-mutation)
++	// and diff it against the resident baselines to find exactly what changed.
++	tReparse := time.Now()
++	reparseCtx := newContext(configuration)
++	reparseCtx.Register()
++	// Fast path: reparse only the .bp files whose content changed, instead of the
++	// whole tree (the O(tree) parse_bp pass, ~4s at AOSP scale). DiffParsedModules
++	// tolerates a partial reparse -- its added/removed detection is scoped by an
++	// on-disk file-hash check, so modules in files we don't reparse are correctly
++	// treated as unchanged. Falls back to a full RunBlueprint when the SET of .bp
++	// files changed (add/remove) or the changed set can't be determined; a full
++	// reparse is always correct.
++	partialReparse := false
++	reparseCtx.SetModuleListFile(cmdlineArgs.ModuleListFile)
++	currentFiles, lerr := reparseCtx.ListModulePaths(".")
++	if lerr != nil {
++		fmt.Fprintf(os.Stderr, "soong_build persistent: ListModulePaths failed (%v) -> full reparse\n", lerr)
++	}
++	if lerr == nil {
++		if changedFiles, okc := ctx.ChangedBlueprintFiles(currentFiles); okc {
++			if len(changedFiles) > 0 {
++				if _, errs := reparseCtx.ParseFileList(".", changedFiles, reparseCtx.Config()); len(errs) > 0 {
++					fullRebuild(fmt.Sprintf("partial reparse error: %v", errs[0]))
++					return
++				}
++			}
++			partialReparse = true
++			fmt.Fprintf(os.Stderr, "soong_build persistent: changed-file reparse: %d of %d .bp files\n",
++				len(changedFiles), len(currentFiles))
++		}
++	}
++	if !partialReparse {
++		if _, err := bootstrap.RunBlueprint(cmdlineArgs.Args, bootstrap.StopBeforeResolveDependencies, reparseCtx.Context, reparseCtx.Config()); err != nil {
++			fullRebuild(fmt.Sprintf("reparse error: %v", err))
++			return
++		}
++	}
++	fmt.Fprintf(os.Stderr, "soong_build persistent: reparse took %v\n", time.Since(tReparse))
++
++	// Reset per-build incremental state BEFORE DiffParsedModules. The diff records
++	// line-shifted clean modules into posShiftedModules, so that map must be
++	// initialized first (else a nil-map write panics) and must not be wiped by a
++	// later reset (which would drop the line-shift tracking and emit stale
++	// "# Defined: file:line" comments -> byte mismatch vs a cold build).
++	ctx.BeginIncrementalBuild()
++
++	changed, added, removed, err := ctx.DiffParsedModules(reparseCtx.Context)
++	if err != nil {
++		fullRebuild(fmt.Sprintf("diff error: %v", err))
++		return
++	}
++
++	// Adding or removing a module splices it into/out of the resident graph
++	// (IncrementalAddModules/Remove), then re-runs the whole-graph singletons over
++	// the new module set (singletonsNeedRegen is true on a membership change;
++	// generateSingletonBuildActions resets each singleton's single-use state first so
++	// the re-run is clean), and rewrites the full manifest (delta write is disabled on
++	// a membership change because shard assignment reshuffles). Structural cases the
++	// incremental path can't represent return ErrFallbackToFullBuild -> full rebuild.
++	if len(removed) > 0 {
++		if errs := ctx.IncrementalRemoveModules(removed); len(errs) > 0 {
++			if blueprint.ErrFallbackToFullBuild(errs[0]) {
++				fullRebuild(fmt.Sprintf("incremental remove fell back: %v", errs[0]))
++				return
++			}
++			maybeQuit(errs[0], "resident incremental remove failed")
++		}
++	}
++	if len(added) > 0 {
++		if errs := ctx.IncrementalAddModules(configuration, reparseCtx.Context, added); len(errs) > 0 {
++			if blueprint.ErrFallbackToFullBuild(errs[0]) {
++				fullRebuild(fmt.Sprintf("incremental add fell back: %v", errs[0]))
++				return
++			}
++			maybeQuit(errs[0], "resident incremental add failed")
++		}
++	}
++	if len(changed) > 0 {
++		if errs := ctx.ReMutate(configuration, changed); len(errs) > 0 {
++			if blueprint.ErrFallbackToFullBuild(errs[0]) {
++				fullRebuild(errs[0].Error())
++				return
++			}
++			maybeQuit(errs[0], "resident re-mutation failed")
++		}
++	}
++	// NOTE: dependent regeneration is handled inside generateTargeted, which expands
++	// the affected set via each regenerated module's interfaceChanged flag (precise:
++	// it only follows reverse-deps when a module's exported provider interface
++	// actually changed). No separate reverse-dep closure here.
++
++	fmt.Fprintf(os.Stderr, "soong_build persistent: REUSING resolved graph (skip parse+resolve+full mutate); %d changed, %d added, %d removed module(s) handled incrementally\n", len(changed), len(added), len(removed))
++
++	tRegen := time.Now()
++	ninjaDeps, err := bootstrap.RegenerateBuildActions(cmdlineArgs.Args, ctx.Context, configuration)
++	maybeQuit(err, "")
++	fmt.Fprintf(os.Stderr, "soong_build persistent: regenerate+write took %v\n", time.Since(tRegen))
++	runBpgenTakeoverAfterSoong(configuration)
++	finalOutputFile := cmdlineArgs.OutFile
++
++	ninjaDeps = append(ninjaDeps, configuration.ProductVariablesFileName)
++	ninjaDeps = append(ninjaDeps, usedEnvFile)
++
++	writeDepFile(finalOutputFile, ctx.EventHandler, ninjaDeps)
++	writeMetrics(configuration, ctx.EventHandler, metricsDir)
++	writeUsedEnvironmentFile(configuration)
++	err = writeGlobFile(ctx.EventHandler, finalOutputFile, ctx.Globs(), soongStartTime)
++	maybeQuit(err, "")
++	touch(shared.JoinPath(topDir, finalOutputFile))
++}
++
++func runBpgenTakeoverAfterSoong(configuration android.Config) {
++	if persistentListen != "" {
++		trackBpgenTakeoverEnv(configuration)
++		return
++	}
++	runBpgenTakeoverIfEnabled(configuration)
++}
++
++func runBpgenTakeoverFromPersistentClient() {
++	topPath, err := filepath.Abs(topDir)
++	maybeQuit(err, "resolving top dir for bpgen")
++	err = os.Chdir(topPath)
++	maybeQuit(err, "changing to top dir for bpgen")
++
++	availableEnv := parseAvailableEnv()
++	configuration, err := android.NewConfig(cmdlineArgs, availableEnv)
++	maybeQuit(err, "")
++	runBpgenTakeoverIfEnabled(configuration)
++}
++
++func trackBpgenTakeoverEnv(configuration android.Config) {
++	if !configuration.IsEnvTrue("SOONG_BPGEN") {
++		return
++	}
++	configuration.Getenv("SOONG_BPGEN_BINARY")
++	configuration.Getenv("SOONG_NINJA_SHARDS")
++	configuration.GetenvWithDefault("SOONG_BPGEN_LOG_LEVEL", "warn")
++	configuration.GetenvWithDefault("SOONG_BPGEN_RAYON_THREADS", "8")
++}
++
++func runBpgenTakeoverIfEnabled(configuration android.Config) {
++	if !configuration.IsEnvTrue("SOONG_BPGEN") {
++		return
++	}
++	if configuration.BuildMode != android.AnalysisNoBazel {
++		return
++	}
++	if !configuration.HasDeviceProduct() {
++		maybeQuit(fmt.Errorf("SOONG_BPGEN=true requires a product build"), "")
++	}
++
++	bpgenBinary := configuration.Getenv("SOONG_BPGEN_BINARY")
++	if bpgenBinary == "" {
++		bpgenBinary = filepath.Join("out", "host", runtime.GOOS+"-x86", "bin", "bpgen")
++	}
++
++	topPath, err := filepath.Abs(topDir)
++	maybeQuit(err, "resolving top dir for bpgen")
++	soongOutDir, err := absolutePathUnderTop(topPath, configuration.SoongOutDir())
++	maybeQuit(err, "resolving Soong out dir for bpgen")
++	bpgenBinary, err = absolutePathUnderTop(topPath, bpgenBinary)
++	maybeQuit(err, "resolving bpgen binary")
++
++	args := []string{
++		"--top", topPath,
++		"--out", soongOutDir,
++		"--product", configuration.DeviceProduct(),
++		"--soong-oracle-output", soongOutDir,
++	}
++	if shards := configuration.Getenv("SOONG_NINJA_SHARDS"); shards != "" {
++		if _, err := strconv.Atoi(shards); err != nil {
++			maybeQuit(fmt.Errorf("invalid SOONG_NINJA_SHARDS=%q: %w", shards, err), "")
++		}
++		args = append(args, "--shards", shards)
++	}
++	if logLevel := configuration.GetenvWithDefault("SOONG_BPGEN_LOG_LEVEL", "warn"); logLevel != "" {
++		args = append(args, "--log-level", logLevel)
++	}
++	rayonThreads := configuration.GetenvWithDefault("SOONG_BPGEN_RAYON_THREADS", "8")
++	if rayonThreads != "" {
++		threads, err := strconv.Atoi(rayonThreads)
++		if err != nil || threads <= 0 {
++			maybeQuit(fmt.Errorf("invalid SOONG_BPGEN_RAYON_THREADS=%q", rayonThreads), "")
++		}
++	}
++
++	start := time.Now()
++	fmt.Fprintf(os.Stderr, "soong_build: SOONG_BPGEN=true, rewriting ninja shards with %s\n", bpgenBinary)
++	cmd := exec.Command(bpgenBinary, args...)
++	cmd.Dir = topPath
++	if rayonThreads != "" {
++		cmd.Env = append(os.Environ(), "RAYON_NUM_THREADS="+rayonThreads)
++	}
++	cmd.Stdout = os.Stderr
++	cmd.Stderr = os.Stderr
++	if err := cmd.Run(); err != nil {
++		maybeQuit(fmt.Errorf("bpgen takeover failed: %w", err), "")
++	}
++	fmt.Fprintf(os.Stderr, "soong_build: bpgen takeover completed in %v\n", time.Since(start))
++}
++
++func absolutePathUnderTop(topPath, path string) (string, error) {
++	if filepath.IsAbs(path) {
++		return filepath.Clean(path), nil
++	}
++	return filepath.Abs(filepath.Join(topPath, path))
+ }
+ 
+ func writeUsedEnvironmentFile(configuration android.Config) {
+diff --git a/cmd/soong_build/persistent.go b/cmd/soong_build/persistent.go
+new file mode 100644
+index 000000000..54b7a0871
+--- /dev/null
++++ b/cmd/soong_build/persistent.go
+@@ -0,0 +1,329 @@
++// Copyright 2026 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package main
++
++// Resident ("persistent") soong_build server.
++//
++// Normally soong_ui spawns soong_build as a fresh process for every build,
++// which pays the Go runtime start-up, a cold heap, and (with incremental
++// analysis) re-opening the multi-GB on-disk action cache every time. When
++// SOONG_PERSISTENT=true, soong_ui sets SOONG_PERSISTENT_SOCK in the soong_build
++// invocation's environment. soong_build then runs in one of two roles:
++//
++//   - client: the short-lived process ninja actually invokes. It forwards its
++//     own command-line args to the resident server over a unix socket (spawning
++//     the server on first use) and exits with the server's status.
++//   - server: a detached, long-lived process started by the first client. It
++//     listens on the socket and runs one analysis per request, staying warm
++//     between builds.
++//
++// Correctness: each request runs a complete analysis on a fresh android.Context,
++// so it is equivalent to a one-shot run. The per-request flags are re-parsed
++// onto a fresh FlagSet so no flag state leaks between builds. Soong's module
++// type / mutator / singleton registration lives in process-global tables that
++// are populated once by init() and only read (never re-populated) by
++// Context.Register(), so re-running analysis in the same process is safe.
++//
++// This is the foundation for incremental resident analysis (reusing the resolved
++// graph across builds); that lands in follow-up changes and is not enabled here.
++//
++// Limitation: a running server is pinned to the soong_build binary that spawned
++// it. If you rebuild soong_build itself, kill the resident server so the next
++// build re-spawns the new binary (see persistentSelfStamp).
++
++import (
++	"bufio"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"net"
++	"os"
++	"os/exec"
++	"strings"
++	"syscall"
++	"time"
++
++	"android/soong/android"
++
++	"github.com/google/blueprint"
++)
++
++// persistentSockEnv is the environment variable soong_ui sets to opt a build
++// into persistent mode; its value is the unix socket path.
++const persistentSockEnv = "SOONG_PERSISTENT_SOCK"
++
++// persistentReuseGraphEnv, when "true", enables the EXPERIMENTAL graph-residency
++// fast path (Phase 2): the resident server keeps the resolved+mutated Blueprint
++// graph in memory and, on subsequent builds, skips parse + ResolveDependencies
++// and only re-generates build actions. See the warnings on
++// blueprint.Context.ResetBuildActionsForReanalysis -- it does not yet re-apply
++// edited Android.bp properties through mutators, so it is for measurement and
++// development only, not correct for arbitrary edits.
++const persistentReuseGraphEnv = "SOONG_PERSISTENT_REUSE_GRAPH"
++
++// reuseGraphMode is set once at server startup from persistentReuseGraphEnv.
++var reuseGraphMode bool
++
++// residentBuildCtx holds the resolved Context from the previous build so the
++// graph-residency fast path can reuse it. nil until the first full build
++// completes. Only used when reuseGraphMode is true.
++var residentBuildCtx *android.Context
++
++// residentCache is the process-resident in-memory build-action cache, created
++// once when the server starts and reused (read on hits, populated on misses) by
++// every build the server handles. It is nil outside persistent server mode, and
++// runBuild() keys its persistent-mode behavior off it being non-nil.
++var residentCache *blueprint.BuildActionCache
++
++// residentReqCount counts builds served since the cache was created. The first
++// build (count 0) populates the cache (analysis=false); later builds read it
++// (analysis=true).
++var residentReqCount int
++
++// detectChangedModules returns the names of modules whose Android.bp definition
++// changed since the resident graph was built. The targeted regenerate path uses
++// this to regenerate only those modules (plus their reverse-dependency closure).
++//
++// TODO(next): re-parse the changed Android.bp files (detected via mtime/inotify)
++// and diff each module's properties against the resident graph. For now this
++// returns nil, which is exactly correct for edits that change no module (e.g.
++// comment- or whitespace-only edits) and lets us validate the targeted-regenerate
++// mechanism (clean modules keep their build actions; output must be byte-identical
++// to a full build).
++func detectChangedModules() []string {
++	return nil
++}
++
++// persistentRequest is sent by the client for each build. Args are exactly the
++// command-line arguments ninja invoked soong_build with (os.Args[1:]); the
++// server re-parses them on a fresh FlagSet.
++type persistentRequest struct {
++	Args []string `json:"args"`
++	// Stamp identifies the client's soong_build binary. If it does not match the
++	// server's, the server exits so a fresh binary can take over.
++	Stamp string `json:"stamp"`
++}
++
++// persistentResponse reports the outcome of a single build request.
++type persistentResponse struct {
++	OK    bool   `json:"ok"`
++	Err   string `json:"err,omitempty"`
++	Stale bool   `json:"stale,omitempty"` // server is shutting down; client should retry
++}
++
++// persistentSelfStamp returns a stamp identifying this soong_build binary so a
++// stale resident server (left over after soong_build was rebuilt) can be
++// detected and replaced.
++func persistentSelfStamp() string {
++	self, err := os.Executable()
++	if err != nil {
++		self = os.Args[0]
++	}
++	if fi, err := os.Stat(self); err == nil {
++		return fmt.Sprintf("%s@%d", self, fi.ModTime().UnixNano())
++	}
++	return self
++}
++
++// ----------------------------------------------------------------------------
++// Server
++// ----------------------------------------------------------------------------
++
++// runPersistentServer listens on the given unix socket and serves one build per
++// connection until the process is killed or a stale-binary request arrives. It
++// does not return under normal operation.
++func runPersistentServer(sockPath string) {
++	// A stale socket file from a previously crashed server would block Listen.
++	_ = os.Remove(sockPath)
++
++	listener, err := net.Listen("unix", sockPath)
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "soong_build persistent: cannot listen on %s: %v\n", sockPath, err)
++		os.Exit(1)
++	}
++	defer listener.Close()
++
++	reuseGraphMode = os.Getenv(persistentReuseGraphEnv) == "true"
++
++	// Create the resident in-memory action cache once; it is reused across every
++	// build this server handles (see runBuild in main.go). The graph-residency
++	// fast path regenerates all modules instead, so it does not use this cache.
++	if !reuseGraphMode {
++		residentCache = blueprint.NewInMemoryBuildActionCache()
++	}
++
++	stamp := persistentSelfStamp()
++	fmt.Fprintf(os.Stderr, "soong_build persistent: ready on %s (pid %d, %s)\n", sockPath, os.Getpid(), stamp)
++
++	for {
++		conn, err := listener.Accept()
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "soong_build persistent: accept failed: %v\n", err)
++			continue
++		}
++		if serveOneBuild(conn, stamp) {
++			// A client with a newer binary connected; step aside.
++			fmt.Fprintf(os.Stderr, "soong_build persistent: binary changed, exiting\n")
++			return
++		}
++	}
++}
++
++// serveOneBuild reads a request, runs a single analysis pass, and replies. It
++// returns true if the server should shut down (the client's binary differs from
++// ours).
++//
++// Note: runBuild() still calls os.Exit on fatal analysis errors via maybeQuit;
++// in that case the server process exits and the client re-spawns it. The happy
++// path returns normally and the loop continues warm.
++func serveOneBuild(conn net.Conn, stamp string) (shutdown bool) {
++	defer conn.Close()
++
++	var req persistentRequest
++	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&req); err != nil {
++		writePersistentResponse(conn, persistentResponse{Err: fmt.Sprintf("decode request: %v", err)})
++		return false
++	}
++
++	fmt.Fprintf(os.Stderr, "soong_build persistent: request received (stampMatch=%v reuseGraphMode=%v haveResidentGraph=%v)\n",
++		req.Stamp == stamp, reuseGraphMode, residentBuildCtx != nil)
++
++	if req.Stamp != "" && req.Stamp != stamp {
++		writePersistentResponse(conn, persistentResponse{Stale: true})
++		return true
++	}
++
++	// Re-parse this request's flags onto a fresh FlagSet. A new FlagSet (rather
++	// than re-using flag.CommandLine) resets every bound variable to its default
++	// first, so values from the previous build cannot leak.
++	fs := flag.NewFlagSet("soong_build", flag.ContinueOnError)
++	registerFlags(fs)
++	if err := fs.Parse(req.Args); err != nil {
++		writePersistentResponse(conn, persistentResponse{Err: fmt.Sprintf("parse args: %v", err)})
++		return false
++	}
++
++	runBuild()
++
++	writePersistentResponse(conn, persistentResponse{OK: true})
++	return false
++}
++
++func writePersistentResponse(conn net.Conn, resp persistentResponse) {
++	if err := json.NewEncoder(conn).Encode(resp); err != nil {
++		fmt.Fprintf(os.Stderr, "soong_build persistent: cannot write response: %v\n", err)
++	}
++}
++
++// ----------------------------------------------------------------------------
++// Client
++// ----------------------------------------------------------------------------
++
++// runPersistentClient forwards this build's args to the resident server at
++// sockPath, spawning the server on first use, and exits with its status.
++func runPersistentClient(sockPath string) {
++	stamp := persistentSelfStamp()
++
++	for attempt := 0; attempt < 2; attempt++ {
++		conn, err := dialOrSpawnServer(sockPath)
++		if err != nil {
++			fmt.Fprintf(os.Stderr, "soong_build persistent: %v\n", err)
++			os.Exit(1)
++		}
++
++		if err := json.NewEncoder(conn).Encode(persistentRequest{Args: os.Args[1:], Stamp: stamp}); err != nil {
++			conn.Close()
++			fmt.Fprintf(os.Stderr, "soong_build persistent: send request: %v\n", err)
++			os.Exit(1)
++		}
++		var resp persistentResponse
++		if err := json.NewDecoder(conn).Decode(&resp); err != nil {
++			conn.Close()
++			fmt.Fprintf(os.Stderr, "soong_build persistent: read response: %v\n", err)
++			os.Exit(1)
++		}
++		conn.Close()
++
++		if resp.Stale {
++			// Old server is stepping aside; loop will re-spawn the new binary.
++			time.Sleep(100 * time.Millisecond)
++			continue
++		}
++		if !resp.OK {
++			fmt.Fprintf(os.Stderr, "soong_build persistent: build failed: %s\n", resp.Err)
++			os.Exit(1)
++		}
++		runBpgenTakeoverFromPersistentClient()
++		return
++	}
++	fmt.Fprintf(os.Stderr, "soong_build persistent: server kept reporting stale\n")
++	os.Exit(1)
++}
++
++// dialOrSpawnServer returns a connection to the resident server, spawning it if
++// it is not already running.
++func dialOrSpawnServer(sockPath string) (net.Conn, error) {
++	if conn, err := net.Dial("unix", sockPath); err == nil {
++		return conn, nil
++	}
++
++	if err := spawnServer(sockPath); err != nil {
++		return nil, fmt.Errorf("spawn server: %w", err)
++	}
++
++	deadline := time.Now().Add(120 * time.Second)
++	for time.Now().Before(deadline) {
++		if conn, err := net.Dial("unix", sockPath); err == nil {
++			return conn, nil
++		}
++		time.Sleep(50 * time.Millisecond)
++	}
++	return nil, fmt.Errorf("resident server did not come up on %s", sockPath)
++}
++
++// spawnServer starts a detached resident soong_build server process.
++func spawnServer(sockPath string) error {
++	self, err := os.Executable()
++	if err != nil {
++		self = os.Args[0]
++	}
++
++	logFile, err := os.Create(sockPath + ".log")
++	if err != nil {
++		return err
++	}
++	defer logFile.Close()
++
++	cmd := exec.Command(self, "--top", topDir, "--persistent", sockPath)
++	cmd.Stdout = logFile
++	cmd.Stderr = logFile
++	// Drop SOONG_PERSISTENT_SOCK so the child runs as a server, not a client.
++	cmd.Env = envWithout(os.Environ(), persistentSockEnv)
++	// Detach into its own session so it outlives this short-lived client.
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
++	return cmd.Start()
++}
++
++func envWithout(env []string, key string) []string {
++	prefix := key + "="
++	out := make([]string, 0, len(env))
++	for _, e := range env {
++		if strings.HasPrefix(e, prefix) {
++			continue
++		}
++		out = append(out, e)
++	}
++	return out
++}
+diff --git a/docs/incremental_soong_tutorial.md b/docs/incremental_soong_tutorial.md
+new file mode 100644
+index 000000000..b2a19b4ed
+--- /dev/null
++++ b/docs/incremental_soong_tutorial.md
+@@ -0,0 +1,343 @@
++# Fast incremental Soong: zero to hero
++
++A tutorial for someone who knows **nothing** about build systems, Soong, or
++Android.bp. By the end you'll understand what the Android build does, why a
++one-line edit used to cost ~95 seconds of "thinking" before any compiling, how we
++made that "thinking" near-instant, and why that unlocks large-scale refactors like
++breaking `system_server` into many small modules.
++
++---
++
++## 1. What is a build system, really?
++
++You have source code (`.cpp`, `.java`, ...). You want runnable artifacts
++(`.so`, `.apk`, the system image). A **build system** figures out:
++
++1. **What** to build and in what order (the "graph": this library depends on that
++   one, so build that one first).
++2. **How** to build each thing (the exact compiler command lines).
++3. **What changed** since last time, so it only redoes the minimum.
++
++Most build systems split into two phases. Keep this split in your head — it's the
++whole story:
++
++- **Analysis** ("thinking"): read the build files, work out the graph and every
++  command that *would* run. Output: a big list of commands with their
++  inputs/outputs.
++- **Execution** ("doing"): actually run the commands that are out of date.
++
++A clean way to picture it:
++
++```
++   build files (.bp)                 a giant list of
++        │                            "to make X, run command Y
++        ▼      ANALYSIS                using inputs Z"            EXECUTION
++   ┌──────────┐  ───────────►   ┌──────────────────────┐   ───────────►   artifacts
++   │ soong_   │                 │  build.ninja (481 MB) │                  (.so/.apk/
++   │ build    │                 └──────────────────────┘                   image)
++   └──────────┘                          │
++                                         ▼
++                                   ninja / siso  (the executor)
++```
++
++## 2. Android's version: Soong, Android.bp, and ninja
++
++Android (AOSP) is huge — hundreds of thousands of build targets. Its build has
++these pieces:
++
++- **Android.bp files**: the build files. They're a simple declarative format. One
++  "module" looks like:
++
++  ```
++  cc_library {
++      name: "libfoo",
++      srcs: ["foo.cpp"],
++      shared_libs: ["libbar"],
++      cflags: ["-Wall"],
++  }
++  ```
++
++  This says "there's a C++ library named `libfoo`, built from `foo.cpp`, it links
++  `libbar`, compile with `-Wall`." A `.bp` file is *data*, not a script.
++
++- **Soong**: the analysis program (written in Go). It reads all the `.bp` files
++  and produces the command list. The core binary is `soong_build`. Soong is built
++  on a library called **Blueprint** (the generic `.bp` parser + graph engine);
++  Soong adds the Android-specific module types (`cc_library`, `java_library`, ...).
++
++- **ninja** (and its newer cousin **siso**): the executor. It reads the command
++  list Soong produced (`build.ninja`, ~481 MB on a phone target) and runs the
++  out-of-date commands.
++
++So one Android build is: `soong_build` (analysis) → `ninja` (execution).
++
++## 3. What `soong_build` actually does (the four steps)
++
++This is the part that matters. `soong_build` runs four steps, in order:
++
++1. **Parse** (`parse_bp`, ~5 s): read every `Android.bp` into memory as "modules"
++   (one object per `cc_library {...}` block).
++
++2. **Mutate / resolve deps** (`resolve_deps`, **~35 s**): this is the clever,
++   expensive step. "Mutators" run over every module and transform the graph. Two
++   things happen here:
++   - **Dependencies** get resolved (`libfoo` → the actual `libbar` object).
++   - **Variants** get created. A single `cc_library` is not built once — it's
++     built for arm, for x86, for the host, for the vendor image, with/without
++     sanitizers, etc. A "transition mutator" *splits* one module into many
++     **variants** (e.g. `libfoo [arm]`, `libfoo [x86]`). So 150,000 source
++     modules become ~hundreds of thousands of variants. Mutators also **merge
++     properties** per variant (e.g. arch-specific cflags get folded in).
++
++3. **Generate** (`generateModuleBuildActions`, ~28 s): ask each variant "what
++   ninja commands do you produce?" This is where `cflags`/`srcs` turn into actual
++   compile commands.
++
++4. **Write the manifest** (`write_files`, ~20 s): serialize all those commands to
++   the 481 MB `build.ninja`.
++
++Plus "singletons" (~16 s): special steps that aggregate across *all* modules (e.g.
++the one that writes the make-compat glue).
++
++Total: **~95 s of analysis** before ninja runs a single compiler.
++
++### The painful part
++
++Here's the kicker: **soong_build is one-shot**. Every build it starts from
++nothing — re-parse, re-mutate, re-generate, re-write — *even if you changed one
++character in one `cflags`*. ninja is incremental (it only recompiles what
++changed), but the 95 s of analysis in front of it is paid in full every time.
++
++So a one-line `.bp` edit = ~95 s of analysis + a few seconds of ninja. That ~95 s
++is pure overhead. That's the problem we attacked.
++
++## 4. The idea: keep the "thinking" warm
++
++Two observations:
++
++1. The machine has plenty of RAM. The fully-analyzed graph is only ~500 MB.
++2. After a one-line edit, **almost the entire graph is identical** to last time.
++
++So: run `soong_build` as a **resident server** — it stays alive between builds and
++keeps the fully-mutated graph in memory. On the next build, instead of redoing all
++95 s, recompute only the part that actually changed.
++
++This is exactly how the fast incremental build engines for Bazel and Buck2 work
++(they call it "Skyframe" / "DICE"): keep a dependency graph of the analysis
++itself, and re-evaluate only the nodes whose inputs changed.
++
++The hard question: **after an `.bp` edit, what is the minimal correct recompute?**
++
++## 5. The key insight (this is the whole trick)
++
++A mutator can only reach another module by walking a **dependency edge** (it calls
++`VisitDirectDeps`, reads a dependency's "provider", etc.). It cannot reach a module
++it has no edge to. Therefore:
++
++> **The dependency graph IS the data-flow graph of the analysis.**
++
++So when you edit module `M`, the only analysis outputs that can change are:
++
++- `M` itself, and
++- modules that **read** `M` (its dependents) — and only if `M`'s *observable
++  outputs* (the values its dependents read) actually changed.
++
++For a typical edit (changing `libfoo`'s `cflags`), `libfoo`'s *interface* (the
++flags it exports to others) doesn't change — so **nothing else needs to be
++touched**. That's why a warm edit can be tiny.
++
++## 6. How we recompute, step by step
++
++We keep, in RAM, for every module:
++
++- a **baseline**: the parsed module exactly as it was *before* mutators ran
++  (`SnapshotPreMutationState`);
++- an **interface hash**: a fingerprint of the values it exposes to dependents
++  (`SnapshotInterfaceHashes`).
++
++On a warm edit we:
++
++1. **Detect what changed** (`DiffParsedModules`): re-parse the tree, compare each
++   module's parsed-property fingerprint to its baseline. Out comes: which modules
++   *changed*, were *added*, or *removed*.
++
++2. **Re-mutate only those** (`ReMutate`). There are three cases, picked
++   automatically:
++
++   - **Property/dependency edit (the 99% case)** — the variant *structure* is
++     unchanged. We do an **in-place re-derive** (`reDeriveInPlace`): for each
++     existing variant of the changed module, reset its properties to the new
++     parsed values and re-run the per-variant mutators (arch merge, sanitizer
++     flags, dependency resolution, ...). The clever bit: we re-run on the
++     *already-split* variants, not on a fresh base. A dependency on a variant
++     resolves by the variant's own arch/os, so it "just works" — this sidesteps a
++     deep ordering problem and means we capture *every* mutator's contribution
++     with no loss.
++
++   - **Variant-set change** (you changed a module's arch list) — the set of
++     variants changes. We do **surgery** (`ReMutateModulesStructural`): compute the
++     new variant set, *add* the new variants (created directly with their
++     arch/os so their deps resolve) and *remove* the dropped ones, then re-derive.
++
++   - **Module add/remove** — `IncrementalAddModules` / `IncrementalRemoveModules`
++     create or delete a module's variants on the live graph.
++
++3. **Propagate exported changes** (`depInterfaceChanged`): during the "generate"
++   step (which visits modules dependencies-first), a dependent is regenerated only
++   if a dependency's *interface hash* actually changed. Propagation **stops** the
++   moment an interface is unchanged — so a local edit doesn't ripple, but an
++   exported-flag change correctly reaches everyone who reads it.
++
++4. **Generate only the dirty modules** and splice their commands into the
++   manifest.
++
++### The safety net (why this is trustworthy)
++
++For anything the fast path can't prove it handles (an exotic combination, a
++genuine cascade), the engine returns a "fall back" signal and the server does a
++normal full `soong_build` — which is always correct. So the result is **never
++wrong**: it's fast for the cases it covers, and correct-but-slower otherwise.
++
++And every covered case is checked **byte-for-byte**: the test suite asserts the
++incremental `build.ninja` is *identical* to a from-scratch build of the edited
++tree, across a corpus of edits (property, dep add/remove, exported-value
++propagation through chains/diamonds/fan-out, multi-arch×os combos, variant
++add/remove, module add/remove, sequential edits including reverts).
++
++## 7. Benchmarks (measured)
++
++A synthetic arch-variantized dependency chain, cold full analysis vs a warm
++one-property edit, on a 72-core Xeon (`TestIncrementalTimingBreakdown`). After
++making each analysis pass O(edit):
++
++| modules | variants | cold analysis | **warm analysis** | speedup | re-mutate / generate |
++|---:|---:|---:|---:|---:|---|
++| 500   | 1,000  | 190 ms   | **~7 ms** | ~25×   | warmup |
++| 2,000 | 4,000  | 660 ms   | **~2 ms** | ~330×  | 1.8 ms / 0.5 ms |
++| 8,000 | 16,000 | 2,600 ms | **~0.8 ms** | **~3,200×** | 0.6 ms / 0.2 ms |
++
++The decisive property: **warm analysis is now O(edit), not O(tree)** -- it is
++sub-millisecond and does *not* grow with the tree (16k variants is as fast as 4k).
++This came from making each pass incremental:
++
++- **re-mutation**: scoped to the changed module (~µs), not the ~35 s whole-tree
++  mutator pipeline.
++- **dependency graph**: a deps-unchanged edit restores the exact pre-edit edges
++  and skips the O(tree) `updateDependencies` rebuild.
++- **generate**: a dependency-ordered worklist that visits only the dirty module
++  plus the provider-interface-propagation closure, not every clean variant.
++- **ninja-name resolution**: reused from the previous build when no new global was
++  introduced (the global set only grows), instead of recomputing names for every
++  global.
++
++All byte-identical to a from-scratch build (verified across the corpus).
++
++What's left is **outside analysis**: the aggregating singletons (which read every
++module, so they are inherently O(tree) and need per-singleton incremental support)
++and the manifest write (the per-module ninja is already cached for incremental-
++tagged modules; an in-RAM spliced manifest removes the rest). Those are the final
++pieces to make the *whole* warm build -- not just analysis -- sub-second at full
++AOSP scale.
++
++Net: the expensive ~35 s re-mutation, plus every other analysis pass, is now a
++sub-millisecond delta that scales with the edit, not the tree -- a ~3,000×
++analysis speedup at 16k variants, provably byte-identical.
++
++## 8. Why this matters for big refactors (e.g. splitting `system_server`)
++
++`system_server` is a giant Java blob. A healthy refactor is to break it into many
++small modules so they build/test independently, have clear ownership, and only the
++touched module rebuilds. But that refactor is itself a *massive sequence of `.bp`
++edits*: add a module, move sources into it, add the dependency edge, repeat —
++thousands of times.
++
++With one-shot Soong, **every one of those edits costs ~95 s of analysis**. That
++makes the refactor loop unbearable: you change one `.bp`, wait a minute and a
++half, see if it compiled, repeat. Tooling that does these edits in bulk is even
++worse — it can't iterate.
++
++With warm incremental Soong:
++
++- **Add a module** → `IncrementalAddModules` handles it without re-analyzing the
++  tree.
++- **Move a `src` / add a `dep`** → in-place re-derive of just the two modules
++  involved.
++- **The dependency you just created** → only its readers re-generate, and only if
++  their interface changed.
++
++So the inner loop of "carve off a piece, wire it up, check it builds" drops from
++~95 s to well under a second of analysis. That's the difference between a refactor
++that's theoretically possible and one a tool (or a person) can actually drive at
++scale — you can run an automated splitter that emits thousands of small `.bp`
++edits and have each one validated almost instantly.
++
++### "In milliseconds, modulo the cost of actually building"
++
++Be precise about what gets fast. A build is **analysis + execution**. This work
++makes **analysis** go from ~95 s to milliseconds for a warm edit. Execution (the
++actual compiling/linking) is a separate cost and is *not* what we changed:
++
++- If the edit doesn't change a module's compiler inputs (e.g. you only moved a
++  source file from module A to module B, or renamed a module), the produced
++  commands are the same, so the executor's cache already has the outputs — nothing
++  recompiles.
++- With **RBE** (remote build execution + a shared cache), any module that someone
++  else (CI, another dev) already built at this exact input is a **cache hit** —
++  the artifact is fetched, not rebuilt. So it's effectively free.
++- Only genuinely-new compiler work (you changed real source semantics) pays real
++  compile time, and even then only for the affected modules.
++
++Net: with warm analysis + RBE caching, a structural refactor step is
++**milliseconds of analysis + (mostly cache hits)**. The only unavoidable cost is
++compiling code that genuinely changed — which is irreducible and exactly what you
++*want* to pay.
++
++This is what makes a large-scale-change tool viable: it can apply an edit, get a
++byte-identical-verified analysis result in milliseconds, and let RBE absorb the
++execution. Thousands of refactor steps become a fast, continuously-verified
++pipeline rather than a multi-month manual slog.
++
++### Scaling the refactor itself
++
++The same graph machinery that makes edits cheap also tells you *what to split* and
++*what breaks*:
++
++- The resident graph already knows every module's dependency edges and exported
++  interface. A splitter can use that to find natural seams (clusters of sources
++  that only talk to each other) and to predict the blast radius of moving a
++  source between modules (who reads its interface).
++- Because a warm edit is validated byte-identically and near-instantly, a
++  large-scale-change tool can apply an edit, get an authoritative "did the graph
++  stay correct + what regenerated" answer in milliseconds, and either keep going
++  or back off — turning a multi-month manual migration into an automated,
++  continuously-verified pipeline.
++
++## 9. Where the code lives (reviewer's map)
++
++- `build/blueprint/incremental_mutation.go` — the engine: baselines, change
++  detection, the three re-mutation strategies, the structure-neutrality gate, and
++  provider-change propagation. All of it.
++- `build/blueprint/incremental_mutation_test.go` — the byte-identical corpus +
++  benchmark.
++- `build/blueprint/context.go` — the generate pass with the dirty-skip +
++  propagation hooks; the `MaybeSnapshotPreMutationState` hook.
++- `build/soong/cmd/soong_build/main.go` (`runBuildReuse`) + `persistent.go` — the
++  resident server that drives all of the above on each warm build.
++- `build/soong/docs/resident_incremental_build.md` — the deeper design doc
++  (measurements, the deps-ordering wall, the remaining frontier).
++
++## 10. Glossary (the words that tripped you up)
++
++- **module**: one `cc_library {...}` (etc.) block in an `Android.bp` file.
++- **variant**: one build of a module for a specific axis (arch=arm, os=android,
++  ...). One module → many variants.
++- **mutator**: a pass that transforms the module graph (creates variants, merges
++  properties, resolves deps). They run as an ordered pipeline.
++- **transition mutator**: a mutator that *splits* a module into variants
++  (arch/os/apex are transition mutators).
++- **provider**: a typed value a module exposes for its dependents to read (e.g.
++  "here are my exported include dirs"). The declared data channel between modules.
++- **manifest / build.ninja**: the file listing every command, produced by analysis
++  and consumed by the executor.
++- **cold vs warm**: cold = analysis from scratch; warm = the resident server
++  reusing the in-memory graph and recomputing only the delta.
+diff --git a/docs/resident_incremental_build.md b/docs/resident_incremental_build.md
+new file mode 100644
+index 000000000..e18ad9fd4
+--- /dev/null
++++ b/docs/resident_incremental_build.md
+@@ -0,0 +1,380 @@
++# Resident Soong: incremental analysis for fast local rebuilds
++
++Status: experimental, opt-in via `SOONG_PERSISTENT_REUSE_GRAPH=true`. Off by
++default; the default build path is unchanged.
++
++This document explains where time goes in an AOSP incremental build, what the
++resident-Soong work changes, why each change is correct, and what remains to
++reach a sub-second warm rebuild. It is written so a reviewer can follow the code
++changes in `build/blueprint` and `build/soong` without prior context.
++
++## 1. Background: how a build runs
++
++An AOSP build has two distinct layers:
++
++```
++  Android.bp files                      build.<config>.ninja            artifacts
++  ───────────────►  soong_build (analysis)  ─────────►  executor (ninja/n2/siso)  ─────────►
++                    parse → resolve → mutate            loads the manifest,
++                    → generate → write ninja            runs the dirty actions
++```
++
++1. **Analysis** (`soong_build`, a Go program): parses every `Android.bp`, resolves
++   dependencies, runs *mutators* (which create per-variant modules and transform
++   properties), calls each module's `GenerateBuildActions`, and writes a single
++   Ninja manifest (`build.<config>.ninja`).
++2. **Execution** (the *executor*): `ninja`, `n2`, or `siso` reads that manifest,
++   builds its in-memory graph, and runs the actions whose inputs changed. soong_ui
++   picks the executor via `SOONG_NINJA` (see `ui/build/config.go`); they all read
++   the same manifest (`ui/build/ninja.go`).
++
++Both layers run as **one-shot processes** today: every `m` re-parses all the
++`Android.bp` files *and* re-loads the whole manifest, even for a one-line edit.
++
++## 2. Where the time goes (measured)
++
++Tree: `aosp_cf_x86_64_phone-trunk_staging`, soong-only, 157 GB RAM machine.
++
++A one-line edit to a leaf `Android.bp`, then `m nothing`:
++
++| phase | cold | notes |
++|---|---:|---|
++| `soong_ui` bootstrap | 5–10 s | env setup, microfactory, nsjail |
++| `parse_bp` | 5 s | parse all 14,130 `Android.bp` |
++| **`resolve_deps` (mutators)** | **34.5 s** | whole-tree dep graph + variant creation |
++| `generateModuleBuildActions` | 22 s | every module's `GenerateBuildActions` |
++| singletons | 15 s | aggregate across all modules |
++| **write `build.ninja`** | **21 s** | 553 MB manifest |
++| executor: load `build.ninja` | ~10 s | parse 553 MB → ~14 GB in-memory graph |
++| the one real compile | ~0.3 s | the only "work" |
++
++Totals ~116 s of overhead to rebuild one file. The on-disk incremental cache
++(`--incremental-build-actions`) does **not** help here (measured 110 s, +RAM): it
++only skips `generateModuleBuildActions`, while `resolve_deps` + write + executor
++load are untouched and it adds a ~9 GB pogreb cache read/write.
++
++The two structural facts that follow:
++
++- The analysis phases are **O(whole tree)** and run every build regardless of how
++  little changed.
++- The executor **re-loads the entire manifest** every build.
++
++## 3. The idea: keep the work resident, redo only the delta
++
++A one-line edit changes one module. Nothing else's analysis output changes. So:
++
++1. Keep the **resolved + mutated module graph in memory** across builds (skip
++   `parse_bp` + `resolve_deps`).
++2. Re-generate build actions for **only the changed modules** (+ any dependents
++   whose inputs changed); keep every clean module's actions as-is.
++3. Skip rewriting the manifest when nothing changed; otherwise patch only the
++   changed parts.
++4. Keep the **executor graph resident** too, so it doesn't re-load 553 MB.
++
++Memory is not the constraint (the graph is ~14 GB; the machine has 157 GB). The
++constraint is that the processes are one-shot.
++
++## 4. What this change implements (the analysis half)
++
++### 4.1 Resident server (`build/soong/cmd/soong_build/persistent.go`)
++
++`soong_build` gains a server mode. When `SOONG_PERSISTENT=true` (or
++`SOONG_PERSISTENT_REUSE_GRAPH=true`), `ui/build/soong.go` sets
++`SOONG_PERSISTENT_SOCK` on the soong_build invocation. soong_build then runs as a
++thin **client** that forwards the build over a unix socket to a long-lived
++**server**.
++
++Critical detail: soong_ui runs the build inside **nsjail** (a PID namespace, see
++`ui/build/sandbox_linux.go`). A server spawned from *inside* nsjail dies when that
++namespace is torn down at build end. So the server must run in the **host
++namespace** — soong_ui runs nsjail as a child, so the host side is outside it. The
++per-build client (inside nsjail) connects to the host server over the socket,
++which is reachable because soong_ui bind-mounts `out/` into the sandbox at the
++same path. A binary-stamp check retires a stale server after `soong_build` is
++rebuilt.
++
++Each request runs on a fresh request-scoped `FlagSet` so no flag state leaks
++between builds.
++
++### 4.2 Graph residency (`build/blueprint/context.go`, `bootstrap/command.go`)
++
++The first build does a full `RunBlueprint` and the server keeps the resolved
++`Context`. Subsequent builds call `bootstrap.RegenerateBuildActions`, which skips
++`list_modules` + `parse_bp` + `ResolveDependencies` and re-enters at
++`PrepareBuildActions`.
++
++`Context.DependenciesReady()` guards this (the graph must be resolved first).
++
++### 4.3 Targeted regeneration (the dirty set)
++
++Re-running *all* modules' `GenerateBuildActions` on a resident graph is both slow
++and **incorrect**: some modules have generate-time global side effects (singletons
++with one-variant guards; `soong_filesystem_creator` *creates* modules during
++generate), so re-running them trips "already generated" / "more than one" guards.
++
++Instead, `Context.MarkModulesDirty(changedNames)` marks the changed modules **plus
++their transitive reverse-dependency closure** as dirty and resets only those.
++`generateModuleBuildActions` then **skips clean modules** (they keep their
++existing `actionDefs`), and `singletonsNeedRegen` skips singletons when nothing is
++dirty. Clean modules are never re-run, so the global-side-effect modules are never
++re-run unless they actually changed.
++
++`Context.preserveLiveGlobals` keeps the global ninja rules/variables/pools from the
++previous generate so clean modules' globals remain emitted.
++
++### 4.4 Re-running generate correctly (single-use state)
++
++Soong's modules are **single-use** for `GenerateBuildActions`. Making them
++re-runnable required handling several pieces of generate-time state. Each fix is
++small and local:
++
++| state | problem | fix |
++|---|---|---|
++| properties slice | grows during generate → re-clone length mismatch | snapshot pristine pre-generate properties in `cloneModules` (`pristineProperties`), restore in `resetModuleBuildActions` |
++| `FreeModuleAfterGenerateBuildActions` | nils `logicModule` mid-pass → dependents visit a nil dep | keep modules live across regenerations |
++| providers | blanket reset wiped **mutator-set** providers (not just generate-set) | snapshot post-mutator providers (`pristineProviders`), restore them; generate re-sets only its own indices |
++| `SingletonModule` one-variant guard | factory returns a shared instance, guard stays set | `SingletonModuleBase.ResetBuildActionsState()` hook, called from the reset |
++| `EventHandler` | events accumulate across builds → `CompletedEvents` duplicate-id panic | `EventHandler.Reset()` per build |
++| background metrics | `collectMetrics` sends on a channel with no reader → deadlock | call `StartBackgroundMetrics` per warm build |
++
++### 4.5 Skip the manifest write when nothing changed
++
++`Context.NinjaUnchanged()` reports a targeted regenerate with zero dirty modules.
++`RegenerateBuildActions` then skips the 553 MB `WriteBuildFile` entirely (soong
++still touches the output so the executor sees it as newer than the edited
++`Android.bp`). When modules *are* dirty, the manifest is rewritten (patching only
++the changed statements is a planned follow-up).
++
++## 5. Correctness
++
++The invariant is: **the resident build's `build.ninja` is byte-identical to a
++clean full build for the same sources.** Validated with `cmp` on a comment-only
++edit (0 dirty): identical across repeated warm builds.
++
++The default build path (flag off) is completely unchanged → zero regression.
++
++Limitation (honest): re-applying an *edited property* through the mutators is not
++yet implemented (`detectChangedModules` is a stub). The mechanism is validated for
++graph-neutral edits; arbitrary edits need the change-detection in §7. Soong's
++mutators do not declare which properties they read, so the change-detection must
++be **conservative**: fall back to a full `RunBlueprint` for any edit it cannot
++prove is graph-neutral (a full build is always correct).
++
++## 6. Results
++
++A one-line `Android.bp` edit, `SOONG_PERSISTENT_REUSE_GRAPH=true`:
++
++| | cold | warm |
++|---|---:|---:|
++| total `m nothing` | ~117 s | ~11 s |
++| soong analysis | ~95 s | **~ms** (resolve_deps + generate + singletons skipped) |
++
++The warm residual (~11 s) is now entirely the **executor re-loading the 553 MB
++manifest (~10 s) + soong_ui bootstrap (~1.5 s)** — the analysis bottleneck is
++gone. Those are addressed by the executor half (§7).
++
++## 7. Roadmap to sub-second warm
++
++1. **Change-detection** (analysis): re-parse only the edited `Android.bp` (via
++   mtime/inotify), diff each module's properties against the resident graph, and
++   feed `MarkModulesDirty`; fall back to a full `RunBlueprint` for structural
++   edits (added/removed module, dependency change, mutator-consumed property).
++   Prune the reverse-dep closure with provider hashes so unaffected dependents
++   stay clean.
++2. **Incremental manifest write**: when N modules are dirty, rewrite only their
++   ninja statements instead of the whole 553 MB.
++3. **Resident executor** (the ~10 s): keep the executor's parsed graph in memory
++   across builds. This is executor-specific and goes behind the existing
++   `ninjaCommand` switch (`ui/build/ninja.go`):
++   - **ninja**: a resident command-index daemon (prototype: ~11 MB resident,
++     21 µs no-op, replays only the affected command) or a ninja-server patch.
++   - **siso**: lean on siso's native persistent/incremental model.
++4. **Daemon entry point**: `m` is one-shot, so it can never be sub-second on its
++   own. Sub-second *warm* requires a resident daemon holding both the soong graph
++   and the executor graph, with the user action as a thin trigger (optionally
++   inotify-driven). The two resident halves above compose into it.
++
++### Phase 2 (separate, larger): CI integration
++
++A persistent build server on CI (e.g. TreeHugger) that keeps the resident graph
++warm across changes and patches+builds only the per-change delta, reusing the same
++resident-analysis + resident-executor architecture. Out of scope here.
++
++## 8. Reviewer's map
++
++`build/blueprint`:
++- `context.go` — `DependenciesReady`, `ResetBuildActionsForReanalysis`,
++  `resetModuleBuildActions`, `MarkModulesDirty`, `singletonsNeedRegen`,
++  `NinjaUnchanged`, `SetKeepPristineModules`, the `dirtyModules`/`preserveLiveGlobals`
++  gates in `generateModuleBuildActions`/`generateSingletonBuildActions`/`PrepareBuildActions`,
++  `pristineProperties`/`pristineProviders` snapshots in `cloneModules`,
++  `restorePristineLogicModule`, in-memory `SetBuildActionCache`.
++- `incremental.go` — `NewInMemoryBuildActionCache`.
++- `metrics/event_handler.go` — `EventHandler.Reset`.
++- `bootstrap/command.go` — `RegenerateBuildActions`.
++
++`build/soong`:
++- `cmd/soong_build/persistent.go` — resident client/server.
++- `cmd/soong_build/main.go` — `runBuild`/`runBuildReuse` split, flag, dispatch.
++- `cmd/soong_build/Android.bp` — add `persistent.go`.
++- `android/singleton_module.go` — `ResetBuildActionsState`.
++- `ui/build/soong.go` — `SOONG_PERSISTENT_SOCK` injection.
++
++## 9. Incremental re-mutation: design + open problems
++
++§7.1 says "re-parse the edited file, mark dirty, fall back otherwise." Making
++that *correct without a conservative fallback for the common case* is the hard
++part — it is Soong's version of Bazel/Buck2 incremental analysis. This section
++records the precise design and the correctness subtleties found while building it,
++so it is buildable.
++
++### 9.1 The mechanism
++
++A `.bp` property edit to module M must recompute M's variants and transformed
++properties. The plan:
++
++1. **Change-detection.** Re-parse the edited file(s) and diff parsed module defs
++   against the resident graph: a name not present → *added*; a resident module in
++   the file not re-parsed → *removed*; present with a different property hash →
++   *modified*.
++2. **Dirty closure.** Start from modified/added/removed modules and take the
++   transitive dependency closure **in both directions**: bottom-up mutators read a
++   module's deps (so a changed dep dirties its dependents), top-down/transition
++   mutators read the other way (so a changed dependent dirties its deps).
++3. **Reset + re-mutate the subtree.** For each dirty module group, remove its
++   mutator-created variants and restore the freshly-parsed base, then re-run the
++   mutator pipeline restricted to the dirty subtree. The per-module work reuses
++   `runMutator`'s `visit` closure (build a `mutatorContext`, `direction.run`);
++   variant creation reuses `createVariations`/`spliceModules`; the dep graph is
++   fixed by `updateDependencies` (`needsUpdateDependencies`).
++4. A change whose closure widens to ~the whole graph (a base library, a
++   wide-fan-in dep edit) degrades to a full `RunBlueprint`. That is *correct*
++   (a full build), and it is the genuinely-structural case, not the common one.
++
++### 9.2 Open correctness problems (why this is multi-quarter)
++
++Each must be solved for "no fallback for the common case, zero bugs":
++
++- **Stage mismatch.** Mutators run as a *sequence*. When re-mutating M, its
++  mutator X reads clean deps — but clean deps are only retained at their *final*
++  (post-all-mutators) state, not their *post-X* state. A mutator that reads a
++  dep's intermediate state would see the wrong value. Bazel/Skyframe solves this
++  by keying every (node, phase) and retaining staged values. Options: (a) snapshot
++  each module's state after each mutator (memory-heavy), or (b) prove (per mutator)
++  that it only reads deps' final/provider state.
++- **Scope inheritance on re-parse.** Blueprint files inherit variable scope from
++  ancestor `Android.bp` files, so re-parsing one file in isolation can mis-resolve
++  variables. Re-parse must reconstruct the file's scope chain (see `parseOne` /
++  `ParseFileList`'s scope handling), or re-parse the whole tree (cheap-ish, ~5 s)
++  and diff — slower but simpler and always correct.
++- **Undeclared mutator inputs.** Soong mutators don't declare which properties
++  they read, so the change's blast radius can't be computed statically. Either add
++  input declarations (large, cross-cutting) or hash-compare each module's full
++  post-mutator state to detect "did this module's output actually change" and
++  propagate from there (a content-addressed evaluation, Skyframe-style).
++- **Global-side-effect mutators.** Some mutators create modules or aggregate
++  global state (e.g. `soong_filesystem_creator`). Re-running them on a subset must
++  not duplicate; they likely need to be marked non-incremental and force a fallback
++  when in the dirty set.
++
++### 9.3 Recommended path
++
++Build it content-addressed (Skyframe-style): give each module a per-mutator
++`(inputHash → outputState)` memo; on a build, re-evaluate a (module, mutator) node
++only when its input hash changes, propagating along the dep graph. This subsumes
++change-detection, the dirty closure, and stage-correctness in one model, and is
++how Bazel/Buck2 do it. The resident graph + targeted generate already built here
++are the substrate it plugs into. This is the multi-quarter core; everything in
++§§1–6 is the validated foundation it builds on.
++
++### 9.4 Implementation status (what is built and byte-verified)
++
++Incremental re-mutation is implemented in `build/blueprint/incremental_mutation.go`
++and byte-verified by `incremental_mutation_test.go` (32 assertions; each asserts
++the incremental ninja is byte-identical to a full build of the edited graph; full
++Blueprint suite passes with zero regressions). It is wired into the resident
++soong_build server (`cmd/soong_build/main.go runBuildReuse`).
++
++**The key insight (post-split re-mutation).** A pre-split base module cannot be
++re-mutated against the resident graph, because the dependency mutators ran *before*
++the transition split in the cold build: re-running them on a base resolves a
++nil-variation edge against an already-variantized dependency and fails (the
++deps-ordering wall). The fix is to re-run mutators on the EXISTING post-split
++variants instead -- `AddDependency` on a variant resolves by the variant's own
++variations, so it just works. This sidesteps the wall and is what makes the
++following sound and no-fallback.
++
++Built and byte-verified (no fallback for any of these):
++
++- **Pre-mutation baselines** (`SnapshotPreMutationState`) + **re-parse diff
++  front-end** (`DiffParsedModules`): a file edit is turned into the exact changed
++  module set with no hand-fed names; added/removed modules are reported for a full
++  rebuild.
++- **In-place re-derive** (`reDeriveInPlace`): for a structure-neutral edit, reset
++  each existing variant to its re-parsed baseline, clear its direct deps, and
++  re-run the FULL bottom-up pipeline (everything except the transition
++  Split/createVariations structure mutators) on the variants in order. This
++  captures EVERY contribution -- arch property merge, sanitizer/lto flags + their
++  deps, dependency add/remove -- with no contribution loss. Variant objects are
++  reused, so dependents need no repointing.
++- **Scoped re-mutation** (`ReMutateModules`): the non-transition path (resets to
++  base + replays the pipeline scoped); valid because without transitions there is
++  no split and the deps-ordering wall does not apply.
++- **Split-only structure-neutrality gate** (`IsStructureNeutral`): a module's
++  variant set is `Split(self)` plus its unedited dependents' requests, so an edit
++  to it can only change the set via `Split`. Comparing `Split` alone decides
++  in-place vs. full rebuild; dependency edits are NOT structural (the re-derive
++  re-runs the dep mutators per variant).
++- **Provider-change propagation** (`SnapshotInterfaceHashes` /
++  `depInterfaceChanged`, folded into the bottom-up generate visit): a clean
++  dependent regenerates iff a dep's exposed-provider interface actually changed,
++  stopping where unchanged.
++- **`ReMutate`** auto-dispatch + graceful fallback: any incremental error becomes
++  a fallback to the authoritative full build (never a hard failure).
++
++Edit classes that are now fast + byte-identical, no fallback: property edits
++(cflags/srcs/outputs/exported) for ANY mutator class incl sanitizer/lto/apex;
++dependency add/remove; exported-interface changes propagated to dependents (direct,
++transitive, diamond, wide fan-out); multiple modules; chains; sequential edits
++(incl revert); source edits (no `.bp` change -> analysis is a no-op).
++
++### 9.5 The remaining frontier (variant-set changes) and its elegant design
++
++The only edits that still fall back to a correct full build are those that change
++a module's **variant set** (`Split` output changes -- e.g. editing a module's arch
++or multilib list) and **module add/remove**. These are implementation-proven to be
++the genuine Skyframe-class frontier:
++
++- Re-splitting from the base hits the deps-ordering wall (above), so it requires
++  either staged per-stage snapshots (keep each module's post-deps/pre-split state
++  resident -- the "everything in memory" approach) or...
++- ...the elegant graph approach: **incremental variant-set surgery on the
++  post-split graph** -- diff new `Split` vs the current variant variations, then
++  *add* the new variants (clone an existing sibling variant, set the new variation,
++  clear deps, re-run the per-variant pipeline -- which resolves deps post-split,
++  cascading to a dependency that lacks the variant) and *remove* the dropped
++  variants (delete the variant + edges, unless a dependent still requests it via an
++  incoming transition). The variant set is the fixpoint `Split(self) ∪
++  incoming(dependents)`, so the incoming requests must be reconstructed from the
++  live dependents' `directDeps`/`outgoingTransitionCache`. A new variant whose
++  dependency lacks the matching variant triggers a bounded cascade down the dep
++  edges.
++
++Both are the content-addressed evaluation of §9.3 specialized to the transition
++graph. The post-split surgery is the more memory-frugal of the two and reuses the
++in-place re-derive already built for the per-variant work.
++
++### 9.6 The other two warm-rebuild phases
++
++Even with analysis fully incremental, a warm rebuild also pays:
++
++- **Singletons** (15.7 s): the big aggregating singletons (phony, androidmk) read
++  EVERY module, so any module change invalidates them -- they are inherently
++  O(tree) per edit unless each singleton is made to emit per-module-keyed output
++  that can be spliced. This is a per-singleton incremental effort, not a single
++  graph trick.
++- **Manifest write** (19.7 s): each module emits a ninja block; only dirty modules'
++  blocks change. The existing `*.incremental.ninja` path already caches per-module
++  ninja for `IncrementalModule`-tagged modules; extending it to keep all blocks in
++  RAM and splice only the dirty ones (feeding the resident executor directly)
++  removes the 481 MB rewrite. This is the in-RAM incremental manifest.
+diff --git a/ui/build/config.go b/ui/build/config.go
+index 1d793ad45..657933f62 100644
+--- a/ui/build/config.go
++++ b/ui/build/config.go
+@@ -1843,6 +1843,11 @@ func (c *configImpl) NinjaBin() string {
+ }
+ 
+ func (c *configImpl) N2Bin() string {
++	// Allow overriding the n2 binary (e.g. a locally-built resident n2) without
++	// replacing the checked-in prebuilt.
++	if b := os.Getenv("N2_BIN"); b != "" {
++		return b
++	}
+ 	path := c.PrebuiltBuildTool("n2")
+ 	// Use musl instead of glibc because glibc on the build server is old and has bugs
+ 	return strings.ReplaceAll(path, "/linux-x86/", "/linux_musl-x86/")
+diff --git a/ui/build/ninja.go b/ui/build/ninja.go
+index 2b31024d4..9af0a95a7 100644
+--- a/ui/build/ninja.go
++++ b/ui/build/ninja.go
+@@ -48,6 +48,16 @@ func runNinja(ctx Context, config Config, ninjaArgs []string) {
+ 	e := ctx.BeginTrace(metrics.PrimaryNinja, "ninja")
+ 	defer e.End()
+ 
++	// Resident n2: when graph residency is enabled and the n2 backend is in use,
++	// route the build to the long-lived n2 server that keeps the parsed graph in
++	// RAM and splices in only the changed subninjas. Falls through to a normal
++	// spawn if the resident path is unavailable.
++	if config.ninjaCommand == NINJA_N2 && os.Getenv("SOONG_PERSISTENT_REUSE_GRAPH") != "" {
++		if runResidentN2(ctx, config, ninjaArgs) {
++			return
++		}
++	}
++
+ 	// Sets up the FIFO status updater that reads the Ninja protobuf output, and
+ 	// translates it to the soong_ui status output, displaying real-time
+ 	// progress of the build.
+diff --git a/ui/build/ninja_resident.go b/ui/build/ninja_resident.go
+new file mode 100644
+index 000000000..e0b03669e
+--- /dev/null
++++ b/ui/build/ninja_resident.go
+@@ -0,0 +1,120 @@
++// Copyright 2024 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package build
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++)
++
++// Resident n2 executor. When SOONG_PERSISTENT_REUSE_GRAPH is set and the n2
++// backend is in use, the ninja phase talks to a long-lived n2 process that holds
++// the parsed build graph in RAM across invocations. soong's delta manifest write
++// leaves the large subninja files mtime-unchanged, so on each build the resident
++// n2 re-reads only the tiny top-level manifest plus the one shard that changed
++// (splice), instead of re-reading the multi-GB manifest from scratch.
++
++func n2ResidentSock(config Config) string {
++	return filepath.Join(config.OutDir(), ".n2_resident.sock")
++}
++
++// runResidentN2 connects to the resident n2 server (starting it if needed) and
++// asks it to build the requested targets. Returns false if the resident path is
++// not usable so the caller can fall back to a normal spawn.
++func runResidentN2(ctx Context, config Config, ninjaArgs []string) bool {
++	sock := n2ResidentSock(config)
++	conn, err := net.Dial("unix", sock)
++	if err != nil {
++		if !startN2Server(ctx, config, sock) {
++			return false
++		}
++		conn = waitN2Server(ctx, sock, 240*time.Second)
++		if conn == nil {
++			return false
++		}
++	}
++	defer conn.Close()
++
++	req := "BUILD " + strings.Join(ninjaArgs, " ") + "\n"
++	if _, err := conn.Write([]byte(req)); err != nil {
++		ctx.Fatalf("n2 resident: write request: %v", err)
++	}
++	resp, err := bufio.NewReader(conn).ReadString('\n')
++	if err != nil && resp == "" {
++		ctx.Fatalf("n2 resident: read response: %v", err)
++	}
++	resp = strings.TrimSpace(resp)
++	fmt.Fprintf(os.Stderr, "n2 resident: %s\n", resp)
++	if !strings.HasPrefix(resp, "OK") {
++		ctx.Fatalf("n2 resident build failed: %s", resp)
++	}
++	return true
++}
++
++// startN2Server spawns the resident n2 server detached (its own session, no
++// sandbox) so it survives across soong_ui invocations. Returns false if n2 is
++// not available.
++func startN2Server(ctx Context, config Config, sock string) bool {
++	n2 := config.N2Bin()
++	if _, err := os.Stat(n2); err != nil {
++		fmt.Fprintf(os.Stderr, "n2 resident: n2 binary %q not found: %v\n", n2, err)
++		return false
++	}
++	os.Remove(sock)
++	logPath := filepath.Join(config.OutDir(), ".n2_resident.log")
++	lf, err := os.Create(logPath)
++	if err != nil {
++		return false
++	}
++	wd, _ := os.Getwd()
++	cmd := exec.Command(n2,
++		"--serve", sock,
++		"-f", config.CombinedNinjaFile(),
++		"-j", strconv.Itoa(config.Parallel()),
++	)
++	cmd.Dir = wd
++	cmd.Stdout = lf
++	cmd.Stderr = lf
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
++	if err := cmd.Start(); err != nil {
++		fmt.Fprintf(os.Stderr, "n2 resident: failed to start server: %v\n", err)
++		return false
++	}
++	fmt.Fprintf(os.Stderr, "n2 resident: started server pid %d, loading graph (log: %s)\n",
++		cmd.Process.Pid, logPath)
++	return true
++}
++
++// waitN2Server polls the socket until the server is accepting connections (the
++// graph finished loading) or the deadline passes.
++func waitN2Server(ctx Context, sock string, timeout time.Duration) net.Conn {
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if conn, err := net.Dial("unix", sock); err == nil {
++			return conn
++		}
++		time.Sleep(200 * time.Millisecond)
++	}
++	fmt.Fprintf(os.Stderr, "n2 resident: server did not become ready within %s\n", timeout)
++	return nil
++}
+diff --git a/ui/build/soong.go b/ui/build/soong.go
+index c9b303c5b..e3b1a0abd 100644
+--- a/ui/build/soong.go
++++ b/ui/build/soong.go
+@@ -226,6 +226,30 @@ func (pb PrimaryBuilderFactory) primaryBuilderInvocation(config Config) bootstra
+ 
+ 	commonArgs = append(commonArgs, "-l", filepath.Join(pb.config.FileListDir(), "Android.bp.list"))
+ 	invocationEnv := make(map[string]string)
++
++	// Opt the main soong_build invocation into resident-server ("persistent")
++	// mode when SOONG_PERSISTENT=true (or SOONG_PERSISTENT_REUSE_GRAPH=true, which
++	// implies it). soong_build reads SOONG_PERSISTENT_SOCK (see
++	// cmd/soong_build/persistent.go) and forwards the build to a long-lived server
++	// on this socket, keeping the analysis process warm between builds.
++	// SOONG_PERSISTENT_REUSE_GRAPH additionally enables the experimental
++	// graph-residency fast path. Both off by default; the var names are matched by
++	// persistentSockEnv / persistentReuseGraphEnv in cmd/soong_build/persistent.go.
++	reuseGraph := os.Getenv("SOONG_PERSISTENT_REUSE_GRAPH") == "true"
++	if pb.name == soongBuildTag && (os.Getenv("SOONG_PERSISTENT") == "true" || reuseGraph) {
++		if sock, err := filepath.Abs(filepath.Join(config.SoongOutDir(), ".soong_build_persistent.sock")); err == nil {
++			invocationEnv["SOONG_PERSISTENT_SOCK"] = sock
++			if reuseGraph {
++				invocationEnv["SOONG_PERSISTENT_REUSE_GRAPH"] = "true"
++			}
++		}
++	}
++	// Forward the ninja-shard count so soong_build (which writes the manifest shards)
++	// and any resident server agree on it. More shards make the delta write and the
++	// resident n2 re-parse finer-grained.
++	if v := os.Getenv("SOONG_NINJA_SHARDS"); v != "" {
++		invocationEnv["SOONG_NINJA_SHARDS"] = v
++	}
+ 	if pb.debugPort != "" {
+ 		//debug mode
+ 		commonArgs = append(commonArgs, "--delve_listen", pb.debugPort,
+@@ -288,6 +312,8 @@ func bootstrapEpochCleanup(ctx Context, config Config) {
+ 				os.Remove(file)
+ 			}
+ 		}
++		os.Remove(blueprint.SingletonsNinjaFile(soongNinjaFile))
++		os.Remove(blueprint.PhonysNinjaFile(soongNinjaFile))
+ 		os.Remove(soongNinjaFile + ".globs")
+ 		os.Remove(soongNinjaFile + ".globs_time")
+ 		os.Remove(soongNinjaFile + ".glob_results")
+@@ -701,6 +727,16 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
+ 
+ 			cmd.Environment = &ninjaEnv
+ 			cmd.Sandbox = soongSandbox
++			if os.Getenv("SOONG_PERSISTENT") == "true" || os.Getenv("SOONG_PERSISTENT_REUSE_GRAPH") == "true" {
++				// The resident soong_build server (spawned by the soong_build client,
++				// see cmd/soong_build/persistent.go) must outlive this build to serve
++				// the next one warm. nsjail runs soong_build in a PID namespace that is
++				// torn down when this bootstrap step exits, which kills the detached
++				// server with it (Setsid does not escape a PID namespace). Run this step
++				// unsandboxed so the server lives in soong_ui's host namespace and
++				// survives. Only active in the experimental persistent mode.
++				cmd.Sandbox = noSandbox
++			}
+ 			cmd.RunAndStreamOrFatal()
+ 		}()
+ 
+@@ -743,6 +779,11 @@ func runSoong(ctx Context, config Config, enforceNoSoongOutput bool) {
+ 			distGzipFile(ctx, config, file, "soong")
+ 		}
+ 	}
++	for _, f := range []string{blueprint.SingletonsNinjaFile(soongNinjaFile), blueprint.PhonysNinjaFile(soongNinjaFile)} {
++		if ok, _ := fileExists(f); ok {
++			distGzipFile(ctx, config, f, "soong")
++		}
++	}
+ 	distFile(ctx, config, config.SoongVarsFile(), "soong")
+ 	distFile(ctx, config, config.SoongExtraVarsFile(), "soong")
+ 
+-- 
+2.43.0
+
