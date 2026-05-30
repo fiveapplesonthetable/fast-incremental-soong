@@ -1,4 +1,4 @@
-From b1ff5f50b0a341fd79fe24b4a66c01f999c53063 Mon Sep 17 00:00:00 2001
+From d40b34093462bd602b5c4e2a1710f55c98d40e11 Mon Sep 17 00:00:00 2001
 From: Zimuzo Ezeozue <zezeozue@google.com>
 Date: Sat, 30 May 2026 15:17:25 +0000
 Subject: [PATCH] =?UTF-8?q?blueprint:=20incremental=20warm-rebuild=20engin?=
@@ -33,7 +33,7 @@ Change-Id: I23773fd9aa72f2d582ea7b0c28d23cc4cd307230
  bootstrap/config.go          |    5 +
  context.go                   |  582 ++++++++---
  incremental.go               |   14 +
- incremental_mutation.go      | 1869 ++++++++++++++++++++++++++++++++++
+ incremental_mutation.go      | 1897 ++++++++++++++++++++++++++++++++++
  incremental_mutation_test.go | 1642 +++++++++++++++++++++++++++++
  incremental_ninja.go         |  940 +++++++++++++++++
  metrics/event_handler.go     |   12 +
@@ -42,7 +42,7 @@ Change-Id: I23773fd9aa72f2d582ea7b0c28d23cc4cd307230
  proptools/hash_provider.go   |   31 +
  singleton_ctx.go             |   17 +
  timing_test_helpers_test.go  |    6 +
- 14 files changed, 5070 insertions(+), 173 deletions(-)
+ 14 files changed, 5098 insertions(+), 173 deletions(-)
  create mode 100644 incremental_mutation.go
  create mode 100644 incremental_mutation_test.go
  create mode 100644 incremental_ninja.go
@@ -1022,10 +1022,10 @@ index ad27b1f..13d31aa 100644
  		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 diff --git a/incremental_mutation.go b/incremental_mutation.go
 new file mode 100644
-index 0000000..77bd919
+index 0000000..799bc64
 --- /dev/null
 +++ b/incremental_mutation.go
-@@ -0,0 +1,1869 @@
+@@ -0,0 +1,1897 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -1043,6 +1043,7 @@ index 0000000..77bd919
 +package blueprint
 +
 +import (
++	"errors"
 +	"fmt"
 +	"hash/fnv"
 +	"io"
@@ -1610,11 +1611,37 @@ index 0000000..77bd919
 +// handle. The caller should fall back to a full RunBlueprint.
 +var errStructuralChange = fmt.Errorf("incremental re-mutation: structural change requires full rebuild")
 +
++// unsupportedMutatorReason returns a short human-readable reason a mutator can't be
++// replayed on a subset of the graph, or "" if it can. Used to make the WARM-FALLBACK
++// log name the exact mutator and why, so a pasted log says what to teach the warm
++// path next (e.g. add incremental support for that transition mutator).
++func unsupportedMutatorReason(m *mutatorInfo) string {
++	switch {
++	case m.transitionMutator != nil || m.transitionPropagateMutator != nil:
++		return "creates variants (transition mutator)"
++	case m.usesCreateModule:
++		return "calls CreateModule"
++	case m.usesRename:
++		return "renames modules"
++	case m.usesReplaceDependencies:
++		return "replaces dependencies"
++	case m.usesReverseDependencies:
++		return "adds reverse dependencies"
++	case m.mutatesGlobalState:
++		return "mutates global state"
++	}
++	return ""
++}
++
 +// ErrFallbackToFullBuild reports whether an error returned by ReMutate means the
 +// edit could not be handled incrementally and the caller should do a full
 +// RunBlueprint (always correct). Both conditions are normal, not failures.
 +func ErrFallbackToFullBuild(err error) bool {
-+	return err == errUnsupportedMutator || err == errStructuralChange
++	// errors.Is so a fallback error may be WRAPPED with a specific, human-readable
++	// reason (which mutator, which module) while still being recognized as a
++	// fall-back-to-full-build signal -- so the WARM-FALLBACK log line names the exact
++	// cause and is self-diagnosing.
++	return errors.Is(err, errUnsupportedMutator) || errors.Is(err, errStructuralChange)
 +}
 +
 +// DiffParsedModules compares a freshly re-parsed context (the same source tree
@@ -2172,10 +2199,11 @@ index 0000000..77bd919
 +	mutatorGroups := coalesceMutators(c.mutatorInfo)
 +	for _, mg := range mutatorGroups {
 +		for _, m := range mg {
-+			if m.transitionMutator != nil || m.transitionPropagateMutator != nil ||
-+				m.usesCreateModule || m.usesRename || m.usesReplaceDependencies ||
-+				m.usesReverseDependencies || m.mutatesGlobalState {
-+				return []error{errUnsupportedMutator}
++			if reason := unsupportedMutatorReason(m); reason != "" {
++				// Name the exact mutator and why, wrapping the sentinel so the
++				// WARM-FALLBACK log says e.g. `mutator "arch" creates variants
++				// (transition)` -- enough to know what to teach the warm path next.
++				return []error{fmt.Errorf("mutator %q %s: %w", m.name, reason, errUnsupportedMutator)}
 +			}
 +		}
 +	}
@@ -2897,7 +2925,7 @@ index 0000000..77bd919
 +}
 diff --git a/incremental_mutation_test.go b/incremental_mutation_test.go
 new file mode 100644
-index 0000000..6e0960c
+index 0000000..71a60b0
 --- /dev/null
 +++ b/incremental_mutation_test.go
 @@ -0,0 +1,1642 @@
@@ -4374,7 +4402,7 @@ index 0000000..6e0960c
 +		ctx.RegisterModuleType("foo_module", newFooModule)
 +	}
 +	errs := remutateBoundaryErr(t, register, `foo_module { name: "A" }`, []string{"A"})
-+	if len(errs) != 1 || errs[0] != errUnsupportedMutator {
++	if len(errs) != 1 || !ErrFallbackToFullBuild(errs[0]) {
 +		t.Fatalf("expected errUnsupportedMutator, got %v", errs)
 +	}
 +}
@@ -4389,7 +4417,7 @@ index 0000000..6e0960c
 +		ctx.RegisterModuleType("bar_module", newBarModule)
 +	}
 +	errs := remutateBoundaryErr(t, register, `foo_module { name: "A" }`, []string{"A"})
-+	if len(errs) != 1 || errs[0] != errUnsupportedMutator {
++	if len(errs) != 1 || !ErrFallbackToFullBuild(errs[0]) {
 +		t.Fatalf("expected errUnsupportedMutator, got %v", errs)
 +	}
 +}

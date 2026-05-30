@@ -95,6 +95,33 @@ property-edit / add / remove on `frameworks/base/Android.bp`, byte-identical.
 cold rebuild of the same tree, and `cmp` the ninja + `.mk` shards (what the test
 scripts do). If they match, that edit class is exact on your config.
 
+## Diagnosing a failure (what to capture)
+
+The logging is built so that a pasted log says *what* failed and *why*. Two
+sources: the soong_ui build output, and the resident server log at
+`out/soong/.soong_build_persistent.sock.log`.
+
+- **"My edit was slow / didn't go warm."** `grep WARM-FALLBACK <build log>`. Each
+  line names the stage and the exact cause, e.g.
+  `WARM-FALLBACK: mutator "arch" creates variants (transition mutator): ... -> full cold rebuild`
+  or `WARM-FALLBACK: incremental add fell back: <reason>`. That line tells you the
+  precise edit class the warm path doesn't yet handle on your tree — enough to know
+  whether it's a quick extension (teach that mutator) or a known limitation. Paste
+  the `WARM-FALLBACK:` line(s).
+
+- **"Warm produced the wrong ninja."** The build log alone won't show this (a warm
+  build that *succeeds* with wrong output doesn't log anything special — that's why
+  the byte-gate exists). Run the validate recipe above; if a shard differs, the
+  script prints `DIFFERS: <shard>`. Paste that list plus the `diff` of one differing
+  shard (warm copy vs the cold-resident `out/soong/<shard>`) — that pinpoints the
+  module/rule that diverged and is enough to root-cause.
+
+- **"It crashed."** The daemon prints a Go stack trace to the server log; paste it.
+
+In all three cases the build is still *correct*: a fallback and a crash both end in
+(or can be re-run as) a full cold rebuild; only a byte-divergence is a real bug, and
+the byte-gate is what surfaces it.
+
 ## What's here
 
 - **`EXPLAINER.md`** — a long-form walkthrough of the whole AOSP build system
