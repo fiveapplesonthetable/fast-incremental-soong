@@ -1,6 +1,6 @@
-From 892059974e9d80bae15a598707e642bd0da51807 Mon Sep 17 00:00:00 2001
+From b1ff5f50b0a341fd79fe24b4a66c01f999c53063 Mon Sep 17 00:00:00 2001
 From: Zimuzo Ezeozue <zezeozue@google.com>
-Date: Sat, 30 May 2026 14:40:16 +0000
+Date: Sat, 30 May 2026 15:17:25 +0000
 Subject: [PATCH] =?UTF-8?q?blueprint:=20incremental=20warm-rebuild=20engin?=
  =?UTF-8?q?e=20=E2=80=94=20O(edit)=20analysis=20+=20write,=20warm=20add?=
 MIME-Version: 1.0
@@ -11,8 +11,8 @@ Content-addressed incremental analysis on a resident graph (baselines,
 DiffParsedModules, scoped re-mutation, provider-interface propagation) plus an
 O(edit) ninja write.
 
-This revision makes add-module warm and byte-identical, and the write O(edit)
-across a membership change:
+This makes property edits, add-module and remove-module warm and byte-identical
+to a cold build, and keeps the write O(edit) across a membership change:
   - ChangedBlueprintFiles: reparse only the .bp files whose content hash changed
     (12 of 14,003 on a real edit; reparse ~4.4s -> ~0.4s);
   - shard the multi-GB incremental-modules subninja like the main modules;
@@ -24,64 +24,44 @@ across a membership change:
     membership change, so add no longer panics (provenance_metadata,
     all_aconfig_declarations) and produces byte-identical output.
 
-All verified byte-identical to cold on real AOSP. Also includes incr/ (a separate
-experimental native-emitter prototype). Local/experimental.
+All verified byte-identical to cold on real AOSP. Local/experimental.
 
 Change-Id: I23773fd9aa72f2d582ea7b0c28d23cc4cd307230
 ---
- Android.bp                        |    3 +
- bootstrap/command.go              |   96 ++
- bootstrap/config.go               |    5 +
- context.go                        | 1304 +++++++++++++++++---
- incr/cmd/qbuild/main.go           |  396 ++++++
- incr/emit_blueprint_go_binary.go  |   58 +
- incr/emit_bootstrap_go_package.go |   74 ++
- incr/emit_droidstubs.go           |   96 ++
- incr/emit_droidstubs_bottom_up.go |   35 +
- incr/emit_droidstubs_load_hook.go |   35 +
- incr/emit_module_exports.go       |  115 ++
- incr/emit_sdk.go                  |   43 +
- incr/emitters.go                  |   68 ++
- incr/engine.go                    |  230 ++++
- incr/pipeline.go                  |  376 ++++++
- incremental.go                    |   14 +
- incremental_mutation.go           | 1868 +++++++++++++++++++++++++++++
- incremental_mutation_test.go      | 1642 +++++++++++++++++++++++++
- metrics/event_handler.go          |   12 +
- name_interface.go                 |    8 +
- ninja_defs.go                     |    9 +-
- proptools/hash_provider.go        |   31 +
- singleton_ctx.go                  |   17 +
- timing_test_helpers_test.go       |    6 +
- 24 files changed, 6394 insertions(+), 147 deletions(-)
- create mode 100644 incr/cmd/qbuild/main.go
- create mode 100644 incr/emit_blueprint_go_binary.go
- create mode 100644 incr/emit_bootstrap_go_package.go
- create mode 100644 incr/emit_droidstubs.go
- create mode 100644 incr/emit_droidstubs_bottom_up.go
- create mode 100644 incr/emit_droidstubs_load_hook.go
- create mode 100644 incr/emit_module_exports.go
- create mode 100644 incr/emit_sdk.go
- create mode 100644 incr/emitters.go
- create mode 100644 incr/engine.go
- create mode 100644 incr/pipeline.go
+ Android.bp                   |    4 +
+ bootstrap/command.go         |   96 ++
+ bootstrap/config.go          |    5 +
+ context.go                   |  582 ++++++++---
+ incremental.go               |   14 +
+ incremental_mutation.go      | 1869 ++++++++++++++++++++++++++++++++++
+ incremental_mutation_test.go | 1642 +++++++++++++++++++++++++++++
+ incremental_ninja.go         |  940 +++++++++++++++++
+ metrics/event_handler.go     |   12 +
+ name_interface.go            |    8 +
+ ninja_defs.go                |   17 +-
+ proptools/hash_provider.go   |   31 +
+ singleton_ctx.go             |   17 +
+ timing_test_helpers_test.go  |    6 +
+ 14 files changed, 5070 insertions(+), 173 deletions(-)
  create mode 100644 incremental_mutation.go
  create mode 100644 incremental_mutation_test.go
+ create mode 100644 incremental_ninja.go
  create mode 100644 timing_test_helpers_test.go
 
 diff --git a/Android.bp b/Android.bp
-index 74308e0..f1c838a 100644
+index 74308e0..5e9ba08 100644
 --- a/Android.bp
 +++ b/Android.bp
-@@ -53,6 +53,7 @@ bootstrap_go_package {
+@@ -53,6 +53,8 @@ bootstrap_go_package {
          "context_gob_enc.go",
          "incremental.go",
          "incremental_gob_enc.go",
 +        "incremental_mutation.go",
++        "incremental_ninja.go",
          "levenshtein.go",
          "glob.go",
          "live_tracker.go",
-@@ -71,6 +72,8 @@ bootstrap_go_package {
+@@ -71,6 +73,8 @@ bootstrap_go_package {
      ],
      testSrcs: [
          "context_test.go",
@@ -228,10 +208,14 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..499baf7 100644
+index 199171c..1dae93e 100644
 --- a/context.go
 +++ b/context.go
-@@ -23,7 +23,6 @@ import (
+@@ -19,11 +19,9 @@ import (
+ 	"bytes"
+ 	"cmp"
+ 	"context"
+-	"encoding/binary"
  	"encoding/json"
  	"errors"
  	"fmt"
@@ -239,7 +223,7 @@ index 199171c..499baf7 100644
  	"hash/fnv"
  	"io"
  	"io/ioutil"
-@@ -182,6 +181,40 @@ type Context struct {
+@@ -182,6 +180,40 @@ type Context struct {
  	// latter will depend on the flag above.
  	incrementalEnabled bool
  
@@ -280,7 +264,7 @@ index 199171c..499baf7 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +223,60 @@ type Context struct {
+@@ -190,6 +222,69 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -319,6 +303,15 @@ index 199171c..499baf7 100644
 +	// BeginIncrementalBuild.
 +	forcedDirtyShards map[int]bool
 +
++	// orderOnlyDirtyModules is the set of otherwise-clean modules whose emitted
++	// order-only deps changed this build because a shared order-only key crossed the
++	// dedup-vs-keep threshold (a dirty module added or dropped a use of that key).
++	// Such a module's on-disk ninja text is stale even though the module itself was
++	// not regenerated, so wasRegenerated() reports it dirty -> its shard is rewritten
++	// and its cached ninja bytes are dropped. Populated by
++	// deduplicateOrderOnlyDepsResident, reset by BeginIncrementalBuild.
++	orderOnlyDirtyModules map[*moduleInfo]bool
++
 +	// regeneratedModules is the set of modules whose build actions (and thus provider
 +	// hashes) were re-run by the last targeted generate -- the originally dirty
 +	// modules PLUS every propagation-affected reader. updateProvidersHashesIncremental
@@ -341,7 +334,7 @@ index 199171c..499baf7 100644
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +448,21 @@ type moduleInfo struct {
+@@ -361,6 +456,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -363,7 +356,7 @@ index 199171c..499baf7 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +514,12 @@ type moduleInfo struct {
+@@ -412,6 +522,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -376,229 +369,18 @@ index 199171c..499baf7 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,6 +896,188 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +904,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
-+// SetBuildActionCache injects a pre-created BuildActionCache (e.g. an in-memory
-+// cache reused across builds by a resident soong_build server) instead of
-+// letting PrepareBuildActions open the on-disk cache lazily. It also wires up
-+// the EncContext, which PrepareBuildActions would otherwise initialize in the
-+// same lazy block. Must be called before PrepareBuildActions.
-+func (c *Context) SetBuildActionCache(cache *BuildActionCache) {
-+	c.buildActionsCache = cache
-+	c.EncContext = gobtools.NewEncContext(cache.referencesDb)
-+}
-+
-+// DependenciesReady reports whether ResolveDependencies (parse + dep resolution
-+// + mutators + variant creation) has already completed on this Context. A
-+// resident server uses this to decide whether the resolved+mutated graph can be
-+// reused for an incremental re-analysis (graph residency).
-+func (c *Context) DependenciesReady() bool {
-+	return c.dependenciesReady
-+}
-+
-+// ResetBuildActionsForReanalysis clears the per-module build actions generated by
-+// the previous PrepareBuildActions pass, while preserving the resolved
-+// dependency graph and module variants (dependenciesReady stays true). After
-+// calling this, PrepareBuildActions can be run again on the same Context and
-+// will skip ResolveDependencies (the ~34.5s phase on a full tree), only
-+// re-generating build actions -- this is the core of "graph residency".
-+//
-+// EXPERIMENTAL / INCOMPLETE: this does NOT re-parse changed Android.bp files or
-+// re-run mutators, so modules are regenerated from the property state captured
-+// during the last full analysis. It is therefore only correct when the resolved
-+// graph is unchanged (same module set, same dependencies/variants) AND edited
-+// properties are re-applied to the module property structs by the caller before
-+// regeneration. Structural edits (added/removed modules or deps, or changes to
-+// mutator-consumed properties) must fall back to a fresh Context. Callers must
-+// gate this behind that safety check and byte-verify the resulting ninja.
-+func (c *Context) ResetBuildActionsForReanalysis() {
-+	parallelVisit(c.iterateAllVariants(), unorderedVisitorImpl{}, parallelVisitLimit,
-+		func(module *moduleInfo, pause pauseFunc) bool {
-+			c.resetModuleBuildActions(module)
-+			return false
-+		})
-+	c.buildActionsReady = false
-+}
-+
-+// resetModuleBuildActions restores a single module to its pristine, pre-generate
-+// state so its GenerateBuildActions can be run again on the resident Context.
-+func (c *Context) resetModuleBuildActions(module *moduleInfo) {
-+	// Module.GenerateBuildActions is single-use: a logicModule that already
-+	// generated build actions caches internal state and cannot be run again.
-+	// Restore a fresh logicModule from the pristine pre-generate snapshot captured
-+	// in cloneModules, so the next generate pass runs on a clean object. (Cloning
-+	// the post-generate module instead would fail, because GenerateBuildActions can
-+	// append to the properties slice.)
-+	module.logicModule, module.properties = c.restorePristineLogicModule(module)
-+	module.logicModule.setInfo(module)
-+
-+	// Some module implementations cache generate-time state in non-property fields
-+	// that CopyProperties does not reset (e.g. SingletonModule's single-variant
-+	// guard), and a few factories return a shared instance rather than a fresh
-+	// object. Give such modules a chance to clear that state before regeneration.
-+	if r, ok := module.logicModule.(interface{ ResetBuildActionsState() }); ok {
-+		r.ResetBuildActionsState()
-+	}
-+
-+	module.actionDefs = localBuildActions{}
-+	module.buildParams = nil
-+	module.startedGenerateBuildActions = false
-+	module.finishedGenerateBuildActions = false
-+	// Restore the post-mutator provider state: keep providers set by mutators
-+	// (which the regenerate pass does not re-run) and drop generate-set ones so the
-+	// regenerate pass can set them again without a double-set. The values and the
-+	// initial-value hashes are rebuilt by generate as needed.
-+	module.providerInfo = providerInfo{
-+		providers: append([]interface{}(nil), module.pristineProviders...),
-+	}
-+	// Drop per-module incremental bookkeeping (cache key, input hash, restored
-+	// providers/globs); it is recomputed during regeneration.
-+	module.incrementalInfo = incrementalInfo{}
-+	// Keep modules live across regenerations. FreeModuleAfterGenerateBuildActions
-+	// nils logicModule after generate (a memory optimization); if left set, the
-+	// regenerate pass would re-free modules mid-flight and a dependent module would
-+	// then visit a nil dependency. The resident graph keeps modules in memory
-+	// anyway, so disabling the free is both correct and desirable. Also clear the
-+	// proxy name caches, which are only populated when a module is freed.
-+	module.freeAfterGenerateBuildActions = false
-+	module.cachedName = ""
-+	module.cachedString = ""
-+	module.cachedUniqueName = ""
-+}
-+
-+// MarkModulesDirty configures the Context for a targeted incremental regenerate.
-+// The named modules and their transitive reverse-dependency closure are marked
-+// dirty and reset to pristine; a following PrepareBuildActions regenerates only
-+// those (generateModuleBuildActions skips clean modules) and keeps every clean
-+// module's existing build actions and globals. This is the minimal-work path:
-+// only the modules whose inputs changed (plus dependents that may read their
-+// changed providers) are re-run. Returns the number of dirty module variants.
-+//
-+// The reverse-dependency closure is conservative (every transitive dependent),
-+// which is always correct; provider-hash comparison can prune it later so that
-+// dependents whose inputs did not actually change are left clean.
-+func (c *Context) MarkModulesDirty(changedModuleNames []string) int {
-+	changed := make(map[string]bool, len(changedModuleNames))
-+	for _, n := range changedModuleNames {
-+		changed[n] = true
-+	}
-+
-+	dirty := map[*moduleInfo]bool{}
-+	var worklist []*moduleInfo
-+	for module := range c.iterateAllVariants() {
-+		if changed[module.group.name] && !dirty[module] {
-+			dirty[module] = true
-+			worklist = append(worklist, module)
-+		}
-+	}
-+	for len(worklist) > 0 {
-+		m := worklist[len(worklist)-1]
-+		worklist = worklist[:len(worklist)-1]
-+		for _, rdep := range m.reverseDeps {
-+			if !dirty[rdep] {
-+				dirty[rdep] = true
-+				worklist = append(worklist, rdep)
-+			}
-+		}
-+	}
-+
-+	for m := range dirty {
-+		c.resetModuleBuildActions(m)
-+	}
-+
-+	c.dirtyModules = dirty
-+	c.preserveLiveGlobals = true
-+	c.buildActionsReady = false
-+	return len(dirty)
-+}
-+
-+// singletonsNeedRegen reports whether singletons must be regenerated. In a full
-+// build (dirtyModules == nil) they always run. In a targeted incremental build
-+// singletons run only on a full (cold) build. On a targeted resident rebuild
-+// (dirtyModules != nil) they are kept: a singleton is single-use and aggregates
-+// state across the whole module set (VisitAllModules + provider reads), so it
-+// cannot be faithfully re-run on the resident Context after the fact -- re-running
-+// it would double-set its providers and read incomplete state, producing wrong or
-+// empty output. Keeping the prior build's singleton actions is correct for the
-+// common case where the edit does not change any singleton's inputs. An edit that
-+// *does* change a singleton input (e.g. adding an aconfig flag) is not yet handled
-+// incrementally and must be caught by the byte-verification gate / fall back to a
-+// full build. See docs/resident_incremental_build.md.
-+func (c *Context) singletonsNeedRegen() bool {
-+	// On a membership change (add/remove) the whole-graph aggregations change, so
-+	// singletons must regenerate over the new module set. generateSingletonBuildActions
-+	// resets each singleton's single-use generate-state first so the re-run is clean.
-+	// A stable-module-set targeted rebuild keeps the prior build's singleton actions.
-+	return c.dirtyModules == nil || c.membershipChanged
-+}
-+
-+// incrementalPureAdd reports whether this warm rebuild only added modules (no
-+// pre-existing module changed). When true, an additive whole-graph singleton may
-+// keep its cached aggregate and fold in only the added modules
-+// (VisitAddedModuleProxies) instead of re-running over every module.
-+func (c *Context) incrementalPureAdd() bool {
-+	if !c.membershipChanged || len(c.incrementalAddedModules) == 0 || c.dirtyModules == nil {
-+		return false
-+	}
-+	added := make(map[*moduleInfo]bool, len(c.incrementalAddedModules))
-+	for _, m := range c.incrementalAddedModules {
-+		added[m] = true
-+	}
-+	for m := range c.dirtyModules {
-+		if !added[m] {
-+			return false
-+		}
-+	}
-+	return true
-+}
-+
-+// NinjaUnchanged reports that a targeted regenerate produced no build-action
-+// changes (no dirty modules, hence no module or singleton output changed), so the
-+// existing ninja file is still current and does not need to be rewritten. Only
-+// meaningful in targeted mode (after MarkModulesDirty).
-+func (c *Context) NinjaUnchanged() bool {
-+	return c.dirtyModules != nil && len(c.dirtyModules) == 0 && !c.forceNinjaWrite
-+}
-+
- func (c *Context) SetIncrementalDebugFile(file string) {
- 	c.incrementalDebugFile = file
- }
-@@ -1710,6 +2000,32 @@ func (c *Context) cloneLogicModule(origModule *moduleInfo) (Module, []interface{
- 	return newLogicModule, newProperties
- }
- 
-+// restorePristineLogicModule creates a fresh logicModule from the factory and
-+// copies in the pristine, pre-generate property snapshot captured by
-+// cloneModules. Used by ResetBuildActionsForReanalysis to make a module's
-+// GenerateBuildActions runnable again on a resident Context.
-+func (c *Context) restorePristineLogicModule(origModule *moduleInfo) (Module, []interface{}) {
-+	if origModule.pristineProperties == nil {
-+		panic("no pristine properties snapshot for " + origModule.Name() +
-+			"; SetKeepPristineModules must be set before analysis for graph-residency reuse")
-+	}
-+
-+	newLogicModule, newProperties := origModule.factory()
-+
-+	if len(newProperties) != len(origModule.pristineProperties) {
-+		panic("mismatched pristine properties array length in " + origModule.Name())
-+	}
-+
-+	for i := range newProperties {
-+		dst := reflect.ValueOf(newProperties[i])
-+		src := reflect.ValueOf(origModule.pristineProperties[i])
-+
-+		proptools.CopyProperties(dst, src)
-+	}
-+
-+	return newLogicModule, newProperties
-+}
-+
- func newVariant(module *moduleInfo, mutatorName string, variationName string) variant {
- 
- 	newVariantName := module.variant.name
-@@ -2936,7 +3252,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+-func (c *Context) SetIncrementalDebugFile(file string) {
+-	c.incrementalDebugFile = file
+-}
+-
+ func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
+ 	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
+ 		return err
+@@ -2936,7 +3048,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -612,7 +394,7 @@ index 199171c..499baf7 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3312,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3108,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -644,7 +426,7 @@ index 199171c..499baf7 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3352,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3148,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -666,7 +448,7 @@ index 199171c..499baf7 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3682,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3478,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -685,156 +467,7 @@ index 199171c..499baf7 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3340,6 +3701,34 @@ func (c *Context) cloneModules() {
- 	}
- }
- 
-+// SetKeepPristineModules makes cloneModules capture a pristine, pre-generate
-+// snapshot of every module's properties, which ResetBuildActionsForReanalysis
-+// uses to re-run build-action generation on a resident Context. Off by default;
-+// only the resident graph-residency reuse path enables it.
-+func (c *Context) SetKeepPristineModules(keep bool) {
-+	c.keepPristineModules = keep
-+}
-+
-+// EnableModuleNinjaCache turns on the per-module serialized-ninja cache so a warm
-+// manifest write re-serializes only dirty modules (O(edit) instead of O(tree)).
-+// The resident server enables it; it is kept in memory across builds.
-+func (c *Context) EnableModuleNinjaCache() {
-+	if c.moduleNinjaCache == nil {
-+		c.moduleNinjaCache = make(map[string][]byte)
-+	}
-+}
-+
-+// MaybeSnapshotPreMutationState captures the pre-mutation baselines needed for
-+// incremental re-mutation, but only in resident mode (keepPristineModules set).
-+// It must be called after ParseFileList and before mutators run; RunBlueprint
-+// invokes it at the right point. A no-op otherwise.
-+func (c *Context) MaybeSnapshotPreMutationState() error {
-+	if !c.keepPristineModules {
-+		return nil
-+	}
-+	return c.SnapshotPreMutationState()
-+}
-+
- // Removes modules[i] from the list and inserts newModules... where it was located, returning
- // the new slice and the index of the last inserted element
- func spliceModules(modules moduleList, i int, newModules moduleList) (moduleList, int) {
-@@ -3363,6 +3752,113 @@ func spliceModules(modules moduleList, i int, newModules moduleList) (moduleList
- 	return dest, i + spliceSize - 1
- }
- 
-+// generateOneModule runs GenerateBuildActions for a single module and folds its
-+// results into liveGlobals. It records whether the module's exposed provider
-+// interface changed (module.interfaceChanged) so dependents can decide to
-+// regenerate. Returns the module's ninja file deps and any errors. Shared by the
-+// full parallel generate pass and the targeted incremental worklist.
-+func (c *Context) generateOneModule(config interface{}, module *moduleInfo, liveGlobals *liveTracker) (ninjaDeps []string, errs []error) {
-+	uniqueName := c.nameInterface.UniqueName(newNamespaceContext(module), module.group.name)
-+	sanitizedName := toNinjaName(uniqueName)
-+	sanitizedVariant := toNinjaName(module.variant.name)
-+
-+	prefix := moduleNamespacePrefix(sanitizedName + "_" + sanitizedVariant)
-+
-+	// The parent scope of the moduleContext's local scope gets overridden to be that of the
-+	// calling Go package on a per-call basis.  Since the initial parent scope doesn't matter we
-+	// just set it to nil.
-+	scope := newLocalScope(nil, prefix)
-+
-+	mctx := &moduleContext{
-+		baseModuleContext: baseModuleContext{
-+			context: c,
-+			config:  config,
-+			module:  module,
-+		},
-+		scope:              scope,
-+		handledMissingDeps: module.missingDeps == nil,
-+	}
-+
-+	// Use a deferred call for this, to avoid errors from trying to evaluate the select()
-+	// expressions in the configurable values that mctx.evaluator encounters too early.
-+	defer func() {
-+		if c.moduleDebugDataChannel != nil {
-+			c.moduleDebugDataChannel <- getModuleDebugJson(mctx.evaluator, module)
-+		}
-+		// The evaluator isn't needed anymore. Avoid possibly cyclic ref that may increase gc load.
-+		mctx.evaluator = nil
-+	}()
-+
-+	mctx.module.startedGenerateBuildActions = true
-+
-+	func() {
-+		defer func() {
-+			if r := recover(); r != nil {
-+				in := fmt.Sprintf("GenerateBuildActions for %s", module)
-+				if err, ok := r.(panicError); ok {
-+					err.addIn(in)
-+					mctx.error(err)
-+				} else {
-+					mctx.error(newPanicErrorf(r, in))
-+				}
-+			}
-+		}()
-+		if !mctx.restoreModuleBuildActions() {
-+			mctx.module.logicModule.GenerateBuildActions(mctx)
-+		}
-+	}()
-+
-+	mctx.module.finishedGenerateBuildActions = true
-+
-+	// Record whether this module's exposed provider interface changed so dependents
-+	// (visited later, bottom-up) can decide to regenerate. Only meaningful during an
-+	// incremental pass with a baseline to compare against.
-+	if c.dirtyModules != nil && c.incMutation != nil && c.incMutation.interfaceHash != nil {
-+		if h, ok := interfaceHashOf(module); ok {
-+			old, had := c.incMutation.interfaceHash[moduleIdentity(uniqueName, module.variant.name)]
-+			module.interfaceChanged = !had || old != h
-+		} else {
-+			module.interfaceChanged = true
-+		}
-+	}
-+
-+	if len(mctx.errs) > 0 {
-+		return nil, mctx.errs
-+	}
-+
-+	if module.missingDeps != nil && !mctx.handledMissingDeps {
-+		var merrs []error
-+		for _, depName := range module.missingDeps {
-+			merrs = append(merrs, c.missingDependencyError(module, depName))
-+		}
-+		return nil, merrs
-+	}
-+
-+	ninjaDeps = mctx.ninjaFileDeps
-+
-+	if mctx.module.freeAfterGenerateBuildActions && !c.keepPristineModules {
-+		// This module is freed after GenerateBuildActions complete, requiring all future accesses
-+		// to go through ModuleProxy instead of the Module.
-+		// Cache Module.Name() and Module.String() for future use in ModuleProxy.Name() and ModuleProxy.String()
-+		// In resident mode (keepPristineModules) the graph stays in memory for warm
-+		// incremental rebuilds; keep logicModule/properties so a later in-place
-+		// re-derive can resolve dependencies through this module (AddDependency ->
-+		// transition resolution reads the dep module, which must not be nil).
-+		mctx.module.cachedName = mctx.module.logicModule.Name()
-+		mctx.module.cachedString = mctx.module.logicModule.String()
-+		mctx.module.logicModule = nil
-+		mctx.module.properties = nil
-+		mctx.module.propertyPos = nil
-+	}
-+
-+	module.cachedUniqueName = uniqueName
-+
-+	if newErrs := c.processLocalBuildActions(&module.actionDefs, &mctx.actionDefs, liveGlobals); len(newErrs) > 0 {
-+		return nil, newErrs
-+	}
-+	return ninjaDeps, nil
-+}
-+
- func (c *Context) generateModuleBuildActions(config interface{},
- 	liveGlobals *liveTracker) ([]string, []error) {
- 
-@@ -3371,6 +3867,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3528,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -855,7 +488,7 @@ index 199171c..499baf7 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,101 +3902,128 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3563,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -878,15 +511,8 @@ index 199171c..499baf7 100644
 -				},
 -				scope:              scope,
 -				handledMissingDeps: module.missingDeps == nil,
-+			nd, es := c.generateOneModule(config, module, liveGlobals)
-+			if len(es) > 0 {
-+				errsCh <- es
-+				return true
- 			}
-+			depsCh <- nd
-+			return false
-+		})
- 
+-			}
+-
 -			// Use a deferred call for this, to avoid errors from trying to evaluate the select()
 -			// expressions in the configurable values that mctx.evaluator encounters too early.
 -			defer func() {
@@ -896,12 +522,9 @@ index 199171c..499baf7 100644
 -				// The evaluator isn't needed anymore. Avoid possibly cyclic ref that may increase gc load.
 -				mctx.evaluator = nil
 -			}()
-+	cancelCh <- struct{}{}
-+	<-cancelCh
- 
+-
 -			mctx.module.startedGenerateBuildActions = true
-+	errs = append(errs, visitErrs...)
- 
+-
 -			func() {
 -				defer func() {
 -					if r := recover(); r != nil {
@@ -918,29 +541,14 @@ index 199171c..499baf7 100644
 -					mctx.module.logicModule.GenerateBuildActions(mctx)
 -				}
 -			}()
-+	// Fold the regenerated modules' new provider interfaces back into the resident
-+	// baseline so the next warm rebuild compares against current values.
-+	c.commitInterfaceHashes()
- 
+-
 -			mctx.module.finishedGenerateBuildActions = true
-+	return deps, errs
-+}
- 
+-
 -			if len(mctx.errs) > 0 {
 -				errsCh <- mctx.errs
 -				return true
 -			}
-+// generateTargeted regenerates only the dirty modules plus the modules reached by
-+// provider-interface propagation, via a worklist in dependency order -- O(edit +
-+// affected) instead of the O(whole-tree) parallel visit that touches every clean
-+// module. A module regenerates when it is dirty (re-mutated) or a dependency's
-+// exposed interface changed this pass; after it generates, if its OWN interface
-+// changed, its reverse-deps are pulled into the affected set. Propagation stops
-+// where an interface is unchanged, so a local edit generates only itself.
-+func (c *Context) generateTargeted(config interface{}, liveGlobals *liveTracker) ([]string, []error) {
-+	var deps []string
-+	var errs []error
- 
+-
 -			if module.missingDeps != nil && !mctx.handledMissingDeps {
 -				var errs []error
 -				for _, depName := range module.missingDeps {
@@ -949,11 +557,7 @@ index 199171c..499baf7 100644
 -				errsCh <- errs
 -				return true
 -			}
-+	inAffected := make(map[*moduleInfo]bool)
-+	done := make(map[*moduleInfo]bool)
-+	remaining := make(map[*moduleInfo]int) // # of affected, not-yet-done forward deps
-+	var ready []*moduleInfo
- 
+-
 -			depsCh <- mctx.ninjaFileDeps
 -
 -			if mctx.module.freeAfterGenerateBuildActions {
@@ -965,12 +569,7 @@ index 199171c..499baf7 100644
 -				mctx.module.logicModule = nil
 -				mctx.module.properties = nil
 -				mctx.module.propertyPos = nil
-+	countAffectedDeps := func(m *moduleInfo) int {
-+		n := 0
-+		for _, fd := range m.forwardDeps {
-+			if inAffected[fd] && !done[fd] {
-+				n++
- 			}
+-			}
 -
 -			module.cachedUniqueName = uniqueName
 -
@@ -978,95 +577,27 @@ index 199171c..499baf7 100644
 -				&mctx.actionDefs, liveGlobals)
 -			if len(newErrs) > 0 {
 -				errsCh <- newErrs
--				return true
-+		}
-+		return n
-+	}
-+	var add func(m *moduleInfo)
-+	add = func(m *moduleInfo) {
-+		if inAffected[m] {
-+			return
-+		}
-+		inAffected[m] = true
-+		// m is now an affected, not-done forward dep of each affected, not-done
-+		// reverse dep, which must therefore wait for it.
-+		for _, rd := range m.reverseDeps {
-+			if inAffected[rd] && !done[rd] {
-+				remaining[rd]++
++			nd, es := c.generateOneModule(config, module, liveGlobals)
++			if len(es) > 0 {
++				errsCh <- es
+ 				return true
  			}
--			return false
--		})
-+		}
-+		remaining[m] = countAffectedDeps(m)
-+		if remaining[m] == 0 {
-+			ready = append(ready, m)
-+		}
-+	}
++			depsCh <- nd
+ 			return false
+ 		})
  
--	cancelCh <- struct{}{}
--	<-cancelCh
-+	for m := range c.dirtyModules {
-+		add(m)
-+	}
+@@ -3487,6 +3577,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
--	errs = append(errs, visitErrs...)
-+	for len(ready) > 0 {
-+		m := ready[len(ready)-1]
-+		ready = ready[:len(ready)-1]
-+		if done[m] || remaining[m] > 0 {
-+			// Stale ready entry: a dependency became affected after m was queued.
-+			continue
-+		}
-+		// A propagated (not pre-reset) module must be reset before regenerating; a
-+		// dirty (re-mutated) module was already reset by re-mutation.
-+		if !c.dirtyModules[m] {
-+			c.resetModuleBuildActions(m)
-+		}
-+		nd, es := c.generateOneModule(config, m, liveGlobals)
-+		deps = append(deps, nd...)
-+		if len(es) > 0 {
-+			errs = append(errs, es...)
-+			break
-+		}
-+		done[m] = true
-+		// Unblock affected reverse-deps that were waiting on m.
-+		for _, rd := range m.reverseDeps {
-+			if inAffected[rd] && !done[rd] {
-+				remaining[rd]--
-+				if remaining[rd] == 0 {
-+					ready = append(ready, rd)
-+				}
-+			}
-+		}
-+		// If m's interface changed, its (other) reverse-deps must regenerate too.
-+		// m is already done, so add() won't miscount it.
-+		if m.interfaceChanged {
-+			for _, rd := range m.reverseDeps {
-+				add(rd)
-+			}
-+		}
-+	}
+ 	errs = append(errs, visitErrs...)
  
-+	// Fold ONLY the regenerated modules' new interfaces back into the resident
-+	// baseline (O(affected), not the O(tree) commitInterfaceHashes over all
-+	// variants). Clean modules' interfaces are unchanged from the last build.
-+	if c.incMutation != nil && c.incMutation.interfaceHash != nil {
-+		for m := range done {
-+			if m.interfaceChanged {
-+				if h, ok := interfaceHashOf(m); ok {
-+					c.incMutation.interfaceHash[moduleIdentity(m.cachedUniqueName, m.variant.name)] = h
-+				}
-+			}
-+		}
-+	}
-+	// Publish the regenerated set (dirty + propagation-affected) so the incremental
-+	// provider-hash fold patches the aggregate for every module whose provider
-+	// hashes could have changed, not just the originally dirty ones.
-+	c.regeneratedModules = done
++	// Fold the regenerated modules' new provider interfaces back into the resident
++	// baseline so the next warm rebuild compares against current values.
++	c.commitInterfaceHashes()
++
  	return deps, errs
  }
  
-@@ -3597,8 +4134,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3691,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -1080,75 +611,10 @@ index 199171c..499baf7 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3670,33 +4210,164 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3670,33 +3767,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
-+// providerTerm folds a module's stable identity salt together with the hash of a
-+// single provider value into one term. The global per-provider aggregate is the
-+// commutative sum of these terms across all modules, which makes it incrementally
-+// updatable: when a module's value changes we subtract its old term and add its
-+// new one. Folding the salt in means two distinct modules whose values happen to
-+// swap cannot net to zero (their terms are different functions), so the aggregate
-+// still flips when content actually changes.
-+func providerTerm(salt, valueHash uint64) uint64 {
-+	h := fnv.New64a()
-+	var b [16]byte
-+	binary.LittleEndian.PutUint64(b[0:8], salt)
-+	binary.LittleEndian.PutUint64(b[8:16], valueHash)
-+	h.Write(b[:])
-+	return h.Sum64()
-+}
-+
-+// providerSalt hashes a module's stable identity into the salt folded into every
-+// one of its provider terms, so distinct modules contribute distinct terms even
-+// when their provider values coincide.
-+func providerSalt(id string) uint64 {
-+	h := fnv.New64a()
-+	io.WriteString(h, id)
-+	return h.Sum64()
-+}
-+
-+func singletonSalt(name string) uint64 {
-+	h := fnv.New64a()
-+	io.WriteString(h, name)
-+	return h.Sum64()
-+}
-+
-+// providerFoldIdentity returns a stable, namespace-qualified identity for a module:
-+// the same logical module+variant yields the same string across warm rebuilds, and
-+// two modules with the same local name in different namespaces do not collide. It is
-+// derived from nameInterface.UniqueName (not the cachedUniqueName field, which
-+// resetModuleBuildActions clears), so it is valid even mid-warm-rebuild.
-+func (c *Context) providerFoldIdentity(m *moduleInfo) string {
-+	uniqueName := c.nameInterface.UniqueName(newNamespaceContext(m), m.group.name)
-+	return moduleIdentity(uniqueName, m.variant.name)
-+}
-+
-+// foldSingletonProviderSlots recomputes the aggregate entries for singleton-set
-+// providers from scratch. There are few singletons, so this is cheap, and it keeps
-+// those slots correct even though the per-module warm delta only touches
-+// module-set providers.
-+func (c *Context) foldSingletonProviderSlots(agg []uint64) {
-+	var sgs []*singletonInfo
-+	c.VisitAllSingletons(func(s SingletonProxy) {
-+		sgs = append(sgs, s.singleton)
-+	})
-+	for i := 0; i < len(providerRegistry); i++ {
-+		if providerRegistry[i].mutator != singletonTag {
-+			continue
-+		}
-+		var sum uint64
-+		for _, s := range sgs {
-+			h := s.providerInitialValueHashes
-+			if i < len(h) && h[i] != 0 {
-+				sum += providerTerm(singletonSalt(s.name), h[i])
-+			}
-+		}
-+		agg[i] = sum
-+	}
-+}
-+
 +// calculateProvidersHashes rebuilds the global per-provider-type aggregate hashes
 +// from scratch (O(tree)). Each module contributes an additive term per provider it
 +// sets; the sum per provider type is what singletons' incremental cache compares
@@ -1208,62 +674,16 @@ index 199171c..499baf7 100644
  	wg.Wait()
 -	for i := range hashers {
 -		c.providerValueHashes = append(c.providerValueHashes, hashers[i].Sum64())
+-	}
 +	c.foldSingletonProviderSlots(agg)
 +
 +	c.providerValueHashes = agg
 +	c.foldedProviderHashes = folded
 +	c.providerHashesFolded = true
-+}
-+
-+// updateProvidersHashesIncremental patches the global provider-hash aggregate for a
-+// warm rebuild by applying only the regenerated modules' deltas (O(edit)) against
-+// the snapshots in foldedProviderHashes, instead of re-summing every module. It is
-+// only safe when the module set is unchanged (membershipChanged == false); the
-+// caller guarantees that, so every changed identity already has a snapshot here
-+// (object replacement keeps the same identity). The regenerated set is the dirty
-+// modules PLUS propagation-affected readers; falling back to dirtyModules supports
-+// direct unit tests that do not run a targeted generate.
-+func (c *Context) updateProvidersHashesIncremental() {
-+	regenerated := c.regeneratedModules
-+	if regenerated == nil {
-+		regenerated = c.dirtyModules
-+	}
-+	for m := range regenerated {
-+		id := c.providerFoldIdentity(m)
-+		salt := providerSalt(id)
-+		cur := m.providerInitialValueHashes
-+		old := c.foldedProviderHashes[id]
-+		limit := len(cur)
-+		if len(old) > limit {
-+			limit = len(old)
-+		}
-+		for i := 0; i < limit; i++ {
-+			var ov, nv uint64
-+			if i < len(old) {
-+				ov = old[i]
-+			}
-+			if i < len(cur) {
-+				nv = cur[i]
-+			}
-+			if ov == nv || providerRegistry[i].mutator == singletonTag {
-+				continue
-+			}
-+			if ov != 0 {
-+				c.providerValueHashes[i] -= providerTerm(salt, ov)
-+			}
-+			if nv != 0 {
-+				c.providerValueHashes[i] += providerTerm(salt, nv)
-+			}
-+		}
-+		c.foldedProviderHashes[id] = slices.Clone(cur)
- 	}
-+	// Singleton-set provider slots are not covered by the per-module delta; refold
-+	// them (cheap) so a singleton consuming another singleton's provider stays sound.
-+	c.foldSingletonProviderSlots(c.providerValueHashes)
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,6 +4379,36 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,6 +3824,36 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -1300,7 +720,7 @@ index 199171c..499baf7 100644
  	// Run one singleton.  Use a variable to simplify manual validation testing.
  	var runSingleton = func(info *singletonInfo) {
  		c.BeginEvent("singleton:" + info.name)
-@@ -3722,7 +4423,14 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3722,7 +3868,14 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -1316,7 +736,7 @@ index 199171c..499baf7 100644
  	}
  
  	// First, take care of any singletons that want to run in parallel.
-@@ -4596,7 +5304,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+@@ -4596,7 +4749,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -1334,98 +754,7 @@ index 199171c..499baf7 100644
  			return
  		}
  	})
-@@ -4604,6 +5321,90 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
- 	return err
- }
- 
-+// SingletonsNinjaFile returns the path of the subninja holding the singleton build
-+// actions, derived from the top-level ninja file name. Exposed so soong_ui can
-+// list/clean it alongside the module shards (GetNinjaShardFiles).
-+func SingletonsNinjaFile(ninjaFile string) string {
-+	return strings.TrimSuffix(ninjaFile, ".ninja") + ".singletons.ninja"
-+}
-+
-+// writeSingletonsSubninja writes the singleton build actions to their own subninja
-+// file and references it from the top-level manifest. On a targeted resident
-+// rebuild the singletons are kept (singletonsNeedRegen is false), so the on-disk
-+// file is already current and is left untouched -- avoiding the dominant cost of
-+// rewriting the large singleton section.
-+func (c *Context) writeSingletonsSubninja(nw *ninjaWriter, ninjaFileName string) error {
-+	file := SingletonsNinjaFile(ninjaFileName)
-+	if err := nw.Subninja(file); err != nil {
-+		return err
-+	}
-+	if c.dirtyModules != nil && !c.singletonsNeedRegen() {
-+		// Resident rebuild keeping singletons: the existing file is byte-exact.
-+		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja\n")
-+		return nil
-+	}
-+	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
-+	if err != nil {
-+		return fmt.Errorf("error opening singletons Ninja file: %s", err)
-+	}
-+	defer f.Close()
-+	buf := bufio.NewWriterSize(f, 16*1024*1024)
-+	sw := newNinjaWriter(buf)
-+	if err := c.writeAllSingletonActions(sw); err != nil {
-+		return err
-+	}
-+	return buf.Flush()
-+}
-+
-+// PhonysNinjaFile returns the path of the subninja holding the deduplicated
-+// order-only-dep phony build statements, derived from the top-level ninja file
-+// name. Exposed so soong_ui can list/clean it alongside the module shards.
-+func PhonysNinjaFile(ninjaFile string) string {
-+	return strings.TrimSuffix(ninjaFile, ".ninja") + ".phonys.ninja"
-+}
-+
-+// writePhonysSubninja writes the deduplicated order-only-dep phony build
-+// statements to their own subninja and references it from the top-level manifest.
-+// This section is large (~60% of the top-level manifest on a full Android tree)
-+// but is a pure function of every module's order-only deps, so on a resident
-+// rebuild it usually does not change. The content is serialized once into memory
-+// and hashed; if the hash matches the previous build (and this is a targeted
-+// rebuild) the existing on-disk file is byte-exact and is left untouched,
-+// avoiding the dominant cost of rewriting it. Otherwise it is written and the
-+// hash recorded.
-+func (c *Context) writePhonysSubninja(nw *ninjaWriter, ninjaFileName string, phonys *localBuildActions) error {
-+	file := PhonysNinjaFile(ninjaFileName)
-+	if err := nw.Subninja(file); err != nil {
-+		return err
-+	}
-+
-+	var bb bytes.Buffer
-+	if err := c.writeLocalBuildActions(newNinjaWriter(&bb), phonys); err != nil {
-+		return err
-+	}
-+	hasher := fnv.New64a()
-+	hasher.Write(bb.Bytes())
-+	sum := hasher.Sum64()
-+	if c.dirtyModules != nil && sum == c.phonysHash {
-+		// Resident rebuild and the phony set is unchanged: the existing file is
-+		// byte-exact, leave it.
-+		fmt.Fprintf(os.Stderr, "soong_build delta write: kept phonys subninja\n")
-+		return nil
-+	}
-+	c.phonysHash = sum
-+
-+	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
-+	if err != nil {
-+		return fmt.Errorf("error opening phonys Ninja file: %s", err)
-+	}
-+	defer f.Close()
-+	out := bufio.NewWriterSize(f, 16*1024*1024)
-+	if _, err := out.Write(bb.Bytes()); err != nil {
-+		return err
-+	}
-+	return out.Flush()
-+}
-+
- type pkgAssociation struct {
- 	PkgName string
- 	PkgPath string
-@@ -4849,15 +5650,97 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5011,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -1438,100 +767,15 @@ index 199171c..499baf7 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
- }
- 
-+// ninjaShardCount is the number of subninja shards the module build statements are
-+// split across. More shards make the resident delta write/reparse finer-grained:
-+// an edit touching one module rewrites (and a resident executor reparses) only the
-+// shard holding it, so smaller shards approach O(edit). The count must be the same
-+// for the cold build that wrote the shards and any warm build that selectively
-+// rewrites them, so it is taken from the environment once and applied everywhere
-+// via GetNinjaShardFiles. Defaults to 10 (historical value).
-+func ninjaShardCount() int {
-+	if v := os.Getenv("SOONG_NINJA_SHARDS"); v != "" {
-+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-+			return n
-+		}
-+	}
-+	return 10
-+}
-+
-+// wasRegenerated reports whether a module's build actions were regenerated in
-+// this targeted rebuild. This is the FULL regenerated set -- the originally dirty
-+// modules PLUS the propagation-affected readers that generateTargeted re-ran
-+// because a dependency's exported interface changed (c.regeneratedModules). The
-+// delta write must key off this, not c.dirtyModules: a propagated module (e.g. a
-+// library that inlines a reordered filegroup's srcs) has new build actions in
-+// memory but is not in dirtyModules, so keying off dirtyModules would skip its
-+// shard and reuse its stale cached ninja text. Falls back to dirtyModules before
-+// generateTargeted has published the regenerated set.
-+func (c *Context) wasRegenerated(m *moduleInfo) bool {
-+	if c.posShiftedModules[m] {
-+		return true // content unchanged, but its "# Defined:" line moved -> re-serialize
-+	}
-+	if c.regeneratedModules != nil {
-+		return c.regeneratedModules[m]
-+	}
-+	return c.dirtyModules[m]
-+}
-+
-+// shardHasDirtyModule reports whether any module in a ninja shard was regenerated
-+// in this targeted rebuild, meaning the shard's on-disk file is stale and must be
-+// rewritten.
-+func (c *Context) shardHasDirtyModule(batch []*moduleInfo) bool {
-+	for _, m := range batch {
-+		if c.wasRegenerated(m) {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
-+// shardModulesStable partitions modules into n shards by a stable hash of each
-+// module's identity (cachedUniqueName + variant), not by sorted position. Unlike
-+// proptools.ShardByCount -- which splits the sorted list into n contiguous chunks,
-+// so inserting one module shifts every later module across shard boundaries -- a
-+// module's shard here depends only on its own identity. Adding or removing a module
-+// therefore leaves every other module in exactly the same shard, which keeps the
-+// delta write O(edit) across a membership change: only the shard(s) holding a
-+// changed or added module are rewritten. The input must be pre-sorted; each shard
-+// preserves that order, so the partition is deterministic and identical between warm
-+// and cold builds.
-+// stableShardIndex returns the shard a module's actions land in, as a stable hash
-+// of its identity (cachedUniqueName + variant) modulo n. Independent of the rest of
-+// the module set, so it survives add/remove.
-+func stableShardIndex(cachedUniqueName, variantName string, n int) int {
-+	if n <= 0 {
-+		return 0
-+	}
-+	h := fnv.New64a()
-+	h.Write([]byte(cachedUniqueName))
-+	h.Write([]byte{0})
-+	h.Write([]byte(variantName))
-+	return int(h.Sum64() % uint64(n))
-+}
-+
-+func shardModulesStable(modules []*moduleInfo, n int) [][]*moduleInfo {
-+	shards := make([][]*moduleInfo, n)
-+	if n <= 0 {
-+		return shards
-+	}
-+	for _, m := range modules {
-+		idx := stableShardIndex(m.cachedUniqueName, m.variant.name, n)
-+		shards[idx] = append(shards[idx], m)
-+	}
-+	return shards
-+}
-+
- func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaFileName string) error {
- 	c.BeginEvent("modules")
- 	defer c.EndEvent("modules")
-@@ -4900,7 +5783,11 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4900,7 +5061,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
 -	if err := c.writeLocalBuildActions(nw, phonys); err != nil {
-+	if shardNinja {
++	if shardNinja && c.residentNinjaLayout() {
++		// Resident (warm) layout only: write phonys to their own subninja so a warm
++		// rebuild can skip rewriting it when the phony set is unchanged. A non-resident
++		// build writes phonys inline (below), exactly as upstream.
 +		if err := c.writePhonysSubninja(nw, ninjaFileName, phonys); err != nil {
 +			return err
 +		}
@@ -1539,12 +783,21 @@ index 199171c..499baf7 100644
  		return err
  	}
  
-@@ -4914,9 +5801,27 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5082,36 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
 -		shardedModules := proptools.ShardByCount(modules, len(files))
-+		shardedModules := shardModulesStable(modules, len(files))
++		// Resident (warm) builds use content-addressed sharding so a module keeps its
++		// shard across edits/add/remove, enabling the O(edit) delta write. Stock
++		// (non-resident) builds keep upstream's position-based ShardByCount, so their
++		// manifest layout is byte-identical to upstream.
++		var shardedModules [][]*moduleInfo
++		if c.residentNinjaLayout() {
++			shardedModules = shardModulesStable(modules, len(files))
++		} else {
++			shardedModules = proptools.ShardByCount(modules, len(files))
++		}
 +		// Delta write: a module's shard is a stable hash of its identity
 +		// (shardModulesStable), so a shard with no changed/added module holds
 +		// byte-exact content from the build that wrote it on disk. Skip rewriting it --
@@ -1568,7 +821,7 @@ index 199171c..499baf7 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5851,46 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5141,62 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -1586,45 +839,61 @@ index 199171c..499baf7 100644
 -			err := writeIncrementalModules(c, file, incModules, headerTemplate)
 -			if err != nil {
 -				errorCh <- err
-+		// Shard the incremental-modules subninja the same way as the main modules.
-+		// It is by far the single largest part of the manifest (multi-GB), and
-+		// re-serializing it whole on every targeted resident rebuild is what
-+		// dominates the warm write (~23s at AOSP scale). ShardByCount is pure over
-+		// the deterministically-sorted incModules, so a shard with no dirty module
-+		// holds byte-exact content from the previous build and is left untouched --
-+		// turning the O(tree) incremental write into O(edit). Warm and cold agree
-+		// because both run this same deterministic sharding.
-+		incFiles := make([]string, len(files))
-+		for i := range incFiles {
-+			incFiles[i] = fmt.Sprintf("%s.incremental.%d%s", base, i, suffix)
-+		}
-+		incShards := shardModulesStable(incModules, len(incFiles))
-+		incSkipped := 0
-+		for i, batch := range incShards {
-+			incFile := incFiles[i]
-+			nw.Subninja(incFile)
-+			if deltaWrite && !c.shardHasDirtyModule(batch) && !c.forcedDirtyShards[i] {
-+				incSkipped++
-+				continue
++		if !c.residentNinjaLayout() {
++			// Stock (non-resident) layout: a single incremental subninja, exactly as
++			// upstream. Keeps the default build's manifest byte-identical to upstream
++			// and the upstream incremental-analysis unit tests passing.
++			file := fmt.Sprintf("%s.incremental%s", base, suffix)
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				if err := writeIncrementalModules(c, file, incModules, headerTemplate); err != nil {
++					errorCh <- err
++				}
++			}()
++			nw.Subninja(file)
++		} else {
++			// Resident (warm) layout: shard the incremental-modules subninja the same
++			// way as the main modules. It is by far the single largest part of the
++			// manifest (multi-GB), and re-serializing it whole on every targeted
++			// resident rebuild is what dominates the warm write (~23s at AOSP scale).
++			// shardModulesStable is pure over module identity, so a shard with no dirty
++			// module holds byte-exact content from the previous build and is left
++			// untouched -- turning the O(tree) incremental write into O(edit). A
++			// resident warm and resident cold build agree because both run this same
++			// deterministic sharding.
++			incFiles := make([]string, len(files))
++			for i := range incFiles {
++				incFiles[i] = fmt.Sprintf("%s.incremental.%d%s", base, i, suffix)
  			}
 -		}()
 -		nw.Subninja(file)
-+			wg.Add(1)
-+			go func(incFile string, batch []*moduleInfo) {
-+				defer wg.Done()
-+				if err := writeIncrementalModules(c, incFile, batch, headerTemplate); err != nil {
-+					errorCh <- err
++			incShards := shardModulesStable(incModules, len(incFiles))
++			incSkipped := 0
++			for i, batch := range incShards {
++				incFile := incFiles[i]
++				nw.Subninja(incFile)
++				if deltaWrite && !c.shardHasDirtyModule(batch) && !c.forcedDirtyShards[i] {
++					incSkipped++
++					continue
 +				}
-+			}(incFile, batch)
-+		}
-+		if deltaWrite && incSkipped > 0 {
-+			fmt.Fprintf(os.Stderr, "soong_build delta write: skipped %d/%d unchanged incremental shards\n",
-+				incSkipped, len(incShards))
++				wg.Add(1)
++				go func(incFile string, batch []*moduleInfo) {
++					defer wg.Done()
++					if err := writeIncrementalModules(c, incFile, batch, headerTemplate); err != nil {
++						errorCh <- err
++					}
++				}(incFile, batch)
++			}
++			if deltaWrite && incSkipped > 0 {
++				fmt.Fprintf(os.Stderr, "soong_build delta write: skipped %d/%d unchanged incremental shards\n",
++					incSkipped, len(incShards))
++			}
 +		}
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5971,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5277,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -1638,7 +907,7 @@ index 199171c..499baf7 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +6054,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5360,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -1675,7 +944,7 @@ index 199171c..499baf7 100644
  			return err
  		}
  	}
-@@ -5270,33 +6232,83 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5538,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -1688,1689 +957,44 @@ index 199171c..499baf7 100644
 -				Rule:          Phony,
 -				OutputStrings: []string{dedup},
 -				InputStrings:  key.ToSlice(),
-+	// Recompute the dedup decision deterministically from the live graph every
-+	// build: a key is deduped iff it is used by >=2 build statements. The count is
-+	// taken from each def's IMMUTABLE OrderOnlyOriginal, so a warm targeted
-+	// rebuild produces the identical decision to a cold build (no persisted
-+	// registration-order state), and the rewrite below is non-destructive (always
-+	// derived from the original, so a decision change is reversible). This is the
-+	// "generate is a pure, content-addressed function of the resolved graph"
-+	// invariant applied to order-only dedup.
-+	type keyInfo struct {
-+		count       int
-+		incremental bool
-+	}
-+	counts := map[uniquelist.UniqueList[string]]*keyInfo{}
-+	bump := func(key uniquelist.UniqueList[string], incremental bool) {
-+		ki := counts[key]
-+		if ki == nil {
-+			ki = &keyInfo{}
-+			counts[key] = ki
-+		}
-+		ki.count++
-+		ki.incremental = ki.incremental || incremental
-+	}
-+	prevCache := c.orderOnlyStringsCache
-+	for _, m := range modules {
-+		if len(m.actionDefs.buildDefs) == 0 {
-+			// Restored module (on-disk incremental): it kept its emitted order-only
-+			// (dedup names) but has no live defs; count its cached originals so a
-+			// shared key stays deduped.
-+			for _, name := range m.orderOnlyStrings {
-+				if orig, ok := prevCache[name]; ok {
-+					bump(uniquelist.Make(orig), true)
-+				}
- 			}
+-			}
 -			info.dedupName = dedup
 -			phonys = append(phonys, phony)
 -			if info.incremental {
 -				c.orderOnlyStringsCache[phony.OutputStrings[0]] = phony.InputStrings
-+			continue
-+		}
-+		for _, def := range m.actionDefs.buildDefs {
-+			if def.OrderOnlyOriginal.Len() == 0 {
-+				continue
- 			}
-+			bump(def.OrderOnlyOriginal, m.buildActionCacheKey != nil)
- 		}
+-			}
+-		}
 -		return true
 -	})
-+	}
-+
-+	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
-+	dedupName := map[uniquelist.UniqueList[string]]string{}
-+	var phonys []*buildDef
-+	for key, ki := range counts {
-+		if ki.count < 2 {
-+			continue
-+		}
-+		name := fmt.Sprintf("dedup-%x", keyForPhonyCandidate(key.ToSlice()))
-+		dedupName[key] = name
-+		phonys = append(phonys, &buildDef{
-+			Rule:          Phony,
-+			OutputStrings: []string{name},
-+			InputStrings:  key.ToSlice(),
-+		})
-+		if ki.incremental {
-+			c.orderOnlyStringsCache[name] = key.ToSlice()
-+		}
-+	}
- 
- 	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
- 		func(m *moduleInfo, pause pauseFunc) bool {
-+			if len(m.actionDefs.buildDefs) == 0 {
-+				return false // restored module: keep its emitted order-only as-is
-+			}
-+			m.orderOnlyStrings = m.orderOnlyStrings[:0]
- 			for _, def := range m.actionDefs.buildDefs {
+-
+-	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
+-		func(m *moduleInfo, pause pauseFunc) bool {
+-			for _, def := range m.actionDefs.buildDefs {
 -				if info, loaded := c.orderOnlyStrings.Load(def.OrderOnlyStrings); loaded {
 -					if info.dedup {
 -						def.OrderOnlyStrings = uniquelist.Make([]string{info.dedupName})
 -						m.orderOnlyStrings = append(m.orderOnlyStrings, info.dedupName)
 -					}
-+				if def.OrderOnlyOriginal.Len() == 0 {
-+					continue
-+				}
-+				if name, ok := dedupName[def.OrderOnlyOriginal]; ok {
-+					def.OrderOnlyStrings = uniquelist.Make([]string{name})
-+					m.orderOnlyStrings = append(m.orderOnlyStrings, name)
-+				} else {
-+					def.OrderOnlyStrings = def.OrderOnlyOriginal
- 				}
- 			}
- 			return false
-diff --git a/incr/cmd/qbuild/main.go b/incr/cmd/qbuild/main.go
-new file mode 100644
-index 0000000..d06fd2c
---- /dev/null
-+++ b/incr/cmd/qbuild/main.go
-@@ -0,0 +1,396 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+// qbuild demonstrates the content-addressed incremental analysis engine on real
-+// frameworks/base Android.bp files.
-+//
-+//	go run ./incr/cmd/qbuild <bp-file> [<bp-file> ...]
-+//
-+// It does a cold build, a warm no-op build, then mutates one module in one file
-+// in memory and rebuilds -- reporting how many queries recompute and verifying
-+// the warm manifest is byte-identical to a cold build of the edited inputs.
-+package main
-+
-+import (
-+	"fmt"
-+	"os"
-+	"regexp"
-+	"strings"
-+	"time"
-+
-+	"github.com/google/blueprint/incr"
-+)
-+
-+func main() {
-+	files := os.Args[1:]
-+	if len(files) == 0 {
-+		fmt.Fprintln(os.Stderr, "usage: qbuild <Android.bp> [<Android.bp> ...]")
-+		os.Exit(2)
-+	}
-+
-+	// Load every file's bytes from disk up front (these are the engine inputs).
-+	content := map[string][]byte{}
-+	for _, f := range files {
-+		b, err := os.ReadFile(f)
-+		if err != nil {
-+			fmt.Fprintf(os.Stderr, "read %s: %v\n", f, err)
-+			os.Exit(1)
-+		}
-+		content[f] = b
-+	}
-+
-+	e := incr.New()
-+	p := incr.NewPipeline(e, files)
-+	for f, b := range content {
-+		p.SetFile(f, b)
-+	}
-+
-+	// --- Cold build -------------------------------------------------------
-+	t0 := time.Now()
-+	cold, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "cold build: %v\n", err)
-+		os.Exit(1)
-+	}
-+	coldDur := time.Since(t0)
-+	fmt.Printf("COLD     %6s  nodes=%d  recomputed=%d  manifest=%d bytes\n",
-+		coldDur.Round(time.Microsecond), e.NodeCount(), e.Recomputed, len(cold.Bytes))
-+
-+	// --- Warm no-op (nothing changed) ------------------------------------
-+	t0 = time.Now()
-+	if _, err := e.Build("manifest"); err != nil {
-+		fmt.Fprintf(os.Stderr, "warm no-op: %v\n", err)
-+		os.Exit(1)
-+	}
-+	fmt.Printf("NO-OP    %6s  recomputed=%d  verified=%d  (expect recomputed=0)\n",
-+		time.Since(t0).Round(time.Microsecond), e.Recomputed, e.Verified)
-+
-+	// --- Edit one module in one file (in memory) -------------------------
-+	target, before, after, ok := pickEdit(content)
-+	if !ok {
-+		fmt.Println("no editable srcs list found in inputs; skipping edit phase")
-+		return
-+	}
-+	edited := map[string][]byte{}
-+	for f, b := range content {
-+		edited[f] = b
-+	}
-+	edited[target.file] = swapBytes(content[target.file], before, after)
-+
-+	p.SetFile(target.file, edited[target.file]) // changes exactly one input
-+	t0 = time.Now()
-+	warm, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "warm edit: %v\n", err)
-+		os.Exit(1)
-+	}
-+	warmDur := time.Since(t0)
-+	fmt.Printf("EDIT     %6s  recomputed=%d  cutoff=%d  (reordered srcs in %s, file %s)\n",
-+		warmDur.Round(time.Microsecond), e.Recomputed, e.Cutoff, target.module, target.file)
-+
-+	// --- Correctness: cold build of the edited inputs, byte-compared ------
-+	e2 := incr.New()
-+	p2 := incr.NewPipeline(e2, files)
-+	for f, b := range edited {
-+		p2.SetFile(f, b)
-+	}
-+	coldEdited, err := e2.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "cold-of-edited: %v\n", err)
-+		os.Exit(1)
-+	}
-+
-+	identical := string(warm.Bytes) == string(coldEdited.Bytes)
-+	changedVsOrig := string(warm.Bytes) != string(cold.Bytes)
-+	fmt.Printf("VERIFY   warm==cold(edited): %v   warm!=cold(orig): %v\n", identical, changedVsOrig)
-+	if coldDur > 0 {
-+		fmt.Printf("SPEEDUP  cold/edit = %.0fx\n", float64(coldDur)/float64(warmDur))
-+	}
-+	ok1 := identical && changedVsOrig
-+
-+	// --- Cross-module edit: change a widely-used `defaults:` module ----------
-+	// This is the case Soong falls back on (a real module edit). The engine
-+	// re-resolves only the edited defaults module and its transitive users; every
-+	// unrelated module early-cuts off.
-+	ok2 := demoDefaultsEdit(files)
-+
-+	// --- Add a new module (the other real edit type) ------------------------
-+	ok3 := demoAddModule(files)
-+
-+	if !ok1 || !ok2 || !ok3 {
-+		os.Exit(1) // correctness gate
-+	}
-+}
-+
-+// demoAddModule appends a brand-new module to one file and verifies the warm
-+// rebuild is byte-identical to a cold build of the edited tree, recomputing only
-+// the new module's chain (the existing modules early-cut off).
-+func demoAddModule(files []string) bool {
-+	content := map[string][]byte{}
-+	for _, f := range files {
-+		if b, err := os.ReadFile(f); err == nil {
-+			content[f] = b
-+		}
-+	}
-+	var target string
-+	for _, f := range files {
-+		if _, ok := content[f]; ok {
-+			target = f
-+			break
-+		}
-+	}
-+	if target == "" {
-+		return true
-+	}
-+
-+	e := incr.New()
-+	p := incr.NewPipeline(e, files)
-+	for f, b := range content {
-+		p.SetFile(f, b)
-+	}
-+	cold, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "addmod cold: %v\n", err)
-+		return false
-+	}
-+
-+	added := append(append([]byte{}, content[target]...),
-+		[]byte("\n\nfilegroup {\n    name: \"incr-probe-added-module\",\n    srcs: [\"Android.bp\"],\n}\n")...)
-+	p.SetFile(target, added)
-+	t0 := time.Now()
-+	warm, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "addmod warm: %v\n", err)
-+		return false
-+	}
-+	dur := time.Since(t0)
-+
-+	e2 := incr.New()
-+	p2 := incr.NewPipeline(e2, files)
-+	for f, b := range content {
-+		if f == target {
-+			p2.SetFile(f, added)
-+		} else {
-+			p2.SetFile(f, b)
-+		}
-+	}
-+	coldEdited, _ := e2.Build("manifest")
-+
-+	identical := string(warm.Bytes) == string(coldEdited.Bytes)
-+	changed := string(warm.Bytes) != string(cold.Bytes)
-+	fmt.Printf("ADDMOD   %6s  recomputed=%d  cutoff=%d  (added a filegroup to %s)\n",
-+		dur.Round(time.Microsecond), e.Recomputed, e.Cutoff, target)
-+	fmt.Printf("ADDMOD   warm==cold(edited): %v   warm!=cold(orig): %v\n", identical, changed)
-+	return identical && changed
-+}
-+
-+// demoDefaultsEdit finds a defaults module referenced by other modules, edits it
-+// on a fresh engine, and verifies the warm rebuild is byte-identical to a cold
-+// build of the edited tree while recomputing only the affected subgraph.
-+func demoDefaultsEdit(files []string) bool {
-+	content := map[string][]byte{}
-+	for _, f := range files {
-+		if b, err := os.ReadFile(f); err == nil {
-+			content[f] = b
-+		}
-+	}
-+	file, name, ok := pickDefaultsModule(content)
-+	if !ok {
-+		fmt.Println("DEFAULTS no referenced defaults module found; skipping")
-+		return true
-+	}
-+
-+	e := incr.New()
-+	p := incr.NewPipeline(e, files)
-+	for f, b := range content {
-+		p.SetFile(f, b)
-+	}
-+	cold, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "defaults cold: %v\n", err)
-+		return false
-+	}
-+
-+	// Inject a property into the defaults module so every user's merged def changes.
-+	edited := injectProp(content[file], name, `    cflags: ["-DINCR_PROBE"],`)
-+	p.SetFile(file, edited)
-+	t0 := time.Now()
-+	warm, err := e.Build("manifest")
-+	if err != nil {
-+		fmt.Fprintf(os.Stderr, "defaults warm: %v\n", err)
-+		return false
-+	}
-+	dur := time.Since(t0)
-+
-+	e2 := incr.New()
-+	p2 := incr.NewPipeline(e2, files)
-+	for f, b := range content {
-+		if f == file {
-+			p2.SetFile(f, edited)
-+		} else {
-+			p2.SetFile(f, b)
-+		}
-+	}
-+	coldEdited, _ := e2.Build("manifest")
-+
-+	identical := string(warm.Bytes) == string(coldEdited.Bytes)
-+	changed := string(warm.Bytes) != string(cold.Bytes)
-+	fmt.Printf("DEFAULTS %6s  recomputed=%d  cutoff=%d  (edited defaults %q in %s)\n",
-+		dur.Round(time.Microsecond), e.Recomputed, e.Cutoff, name, file)
-+	fmt.Printf("DEFAULTS warm==cold(edited): %v   warm!=cold(orig): %v\n", identical, changed)
-+	return identical && changed
-+}
-+
-+// pickDefaultsModule finds a module name that appears in some module's
-+// `defaults: [...]` list AND is itself defined, returning its file and name.
-+func pickDefaultsModule(content map[string][]byte) (string, string, bool) {
-+	var order []string
-+	for f := range content {
-+		order = append(order, f)
-+	}
-+	sortStrings(order)
-+	// Collect referenced defaults names.
-+	referenced := map[string]bool{}
-+	for _, f := range order {
-+		for _, m := range defaultsRe.FindAllStringSubmatch(string(content[f]), -1) {
-+			for _, n := range quoted.FindAllStringSubmatch(m[1], -1) {
-+				referenced[n[1]] = true
-+			}
-+		}
-+	}
-+	// Find one that is defined.
-+	for _, f := range order {
-+		for _, m := range nameRe.FindAllStringSubmatch(string(content[f]), -1) {
-+			if referenced[m[1]] {
-+				return f, m[1], true
-+			}
-+		}
-+	}
-+	return "", "", false
-+}
-+
-+var defaultsRe = regexp.MustCompile(`(?s)defaults:\s*\[(.*?)\]`)
-+var quoted = regexp.MustCompile(`"([^"]+)"`)
-+
-+// injectProp inserts a property line right after the `name: "<name>"` line of the
-+// named module.
-+func injectProp(src []byte, name, line string) []byte {
-+	lines := splitLines(src)
-+	target := `name: "` + name + `"`
-+	for i, l := range lines {
-+		if strings.Contains(l, target) {
-+			out := append([]string{}, lines[:i+1]...)
-+			out = append(out, line)
-+			out = append(out, lines[i+1:]...)
-+			return []byte(strings.Join(out, "\n"))
-+		}
-+	}
-+	return src
-+}
-+
-+type editTarget struct {
-+	file, module string
-+}
-+
-+// srcLine matches a single quoted source entry line (no backreference; RE2-safe).
-+var srcLine = regexp.MustCompile(`^(\s*)"[^"]+\.(?:java|kt|aidl|proto|logtags|cpp|cc|c|h)",\s*$`)
-+var nameRe = regexp.MustCompile(`name:\s*"([^"]+)"`)
-+
-+// pickEdit scans for two adjacent, identically-indented source entries to swap
-+// (a real reorder edit) and returns the file, the enclosing module name, and the
-+// exact before/after byte snippets to swap.
-+func pickEdit(content map[string][]byte) (editTarget, []byte, []byte, bool) {
-+	var order []string
-+	for f := range content {
-+		order = append(order, f)
-+	}
-+	sortStrings(order)
-+	for _, f := range order {
-+		lines := splitLines(content[f])
-+		for i := 0; i+1 < len(lines); i++ {
-+			ma := srcLine.FindStringSubmatch(lines[i])
-+			mb := srcLine.FindStringSubmatch(lines[i+1])
-+			if ma == nil || mb == nil || ma[1] != mb[1] || lines[i] == lines[i+1] {
-+				continue
-+			}
-+			before := []byte(lines[i] + "\n" + lines[i+1])
-+			after := []byte(lines[i+1] + "\n" + lines[i])
-+			return editTarget{file: f, module: nearestModuleName(lines, i)}, before, after, true
-+		}
-+	}
-+	return editTarget{}, nil, nil, false
-+}
-+
-+func nearestModuleName(lines []string, idx int) string {
-+	for j := idx; j >= 0; j-- {
-+		if m := nameRe.FindStringSubmatch(lines[j]); m != nil {
-+			return m[1]
-+		}
-+	}
-+	return "?"
-+}
-+
-+func splitLines(b []byte) []string {
-+	return splitOn(string(b), '\n')
-+}
-+
-+func splitOn(s string, sep byte) []string {
-+	var out []string
-+	start := 0
-+	for i := 0; i < len(s); i++ {
-+		if s[i] == sep {
-+			out = append(out, s[start:i])
-+			start = i + 1
-+		}
-+	}
-+	out = append(out, s[start:])
-+	return out
-+}
-+
-+func swapBytes(src, before, after []byte) []byte {
-+	i := indexOf(src, before)
-+	if i < 0 {
-+		return src
-+	}
-+	out := make([]byte, 0, len(src))
-+	out = append(out, src[:i]...)
-+	out = append(out, after...)
-+	out = append(out, src[i+len(before):]...)
-+	return out
-+}
-+
-+func indexOf(haystack, needle []byte) int {
-+	return indexBytes(haystack, needle)
-+}
-+
-+func indexBytes(h, n []byte) int {
-+outer:
-+	for i := 0; i+len(n) <= len(h); i++ {
-+		for j := 0; j < len(n); j++ {
-+			if h[i+j] != n[j] {
-+				continue outer
-+			}
-+		}
-+		return i
-+	}
-+	return -1
-+}
-+
-+func sortStrings(s []string) {
-+	for i := 1; i < len(s); i++ {
-+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-+			s[j-1], s[j] = s[j], s[j-1]
-+		}
-+	}
-+}
-diff --git a/incr/emit_blueprint_go_binary.go b/incr/emit_blueprint_go_binary.go
-new file mode 100644
-index 0000000..19dd05a
---- /dev/null
-+++ b/incr/emit_blueprint_go_binary.go
-@@ -0,0 +1,58 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+import (
-+	"bytes"
-+	"fmt"
-+	"strings"
-+)
-+
-+// blueprint_go_binary is the Soong build-itself type for a Go binary that
-+// minibp links during the bootstrap stage (bpfmt, bpfix, soong_build,
-+// loadplugins, gotestmain, gotestrunner, etc.). It is structurally a
-+// bootstrap_go_package that additionally runs g.bootstrap.link to produce a
-+// host binary at out/host/linux-x86/bin/<name>.
-+//
-+// What the emitter captures here:
-+//
-+//   - srcs are the .go files that make up the main package.
-+//   - deps are other bootstrap_go_package archives the link step pulls in;
-+//     a change to any of them must propagate to this binary, which is exactly
-+//     what threading depHashes into the resolved hash gives us.
-+//   - The install path is out/host/linux-x86/bin/<name>, matching what the
-+//     real bootstrap.ninja emits, so a textual diff against ninja is meaningful.
-+func emitBlueprintGoBinary(name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	id := fmt.Sprintf("%016x", hashBytes(resolvedDef))
-+	dep := fmt.Sprintf("%016x", hashBytes(depHashes))
-+	srcs := strings.TrimSpace(res.props["srcs"])
-+
-+	var b bytes.Buffer
-+	fmt.Fprintf(&b, "# module %s (blueprint_go_binary)\n", name)
-+	fmt.Fprintf(&b, "build out/host/linux-x86/bin/go/%s/pkg/%s.a: g.bootstrap.compile\n", name, name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	if srcs != "" {
-+		fmt.Fprintf(&b, "    srcs = %s\n", srcs)
-+	}
-+	fmt.Fprintf(&b, "build out/host/linux-x86/bin/%s: g.bootstrap.link out/host/linux-x86/bin/go/%s/pkg/%s.a\n", name, name, name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	return b.Bytes()
-+}
-+
-+func init() {
-+	registerEmitter("blueprint_go_binary", emitBlueprintGoBinary)
-+}
-diff --git a/incr/emit_bootstrap_go_package.go b/incr/emit_bootstrap_go_package.go
-new file mode 100644
-index 0000000..dd9beb4
---- /dev/null
-+++ b/incr/emit_bootstrap_go_package.go
-@@ -0,0 +1,74 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+import (
-+	"bytes"
-+	"fmt"
-+	"strings"
-+)
-+
-+// bootstrap_go_package is the Soong build-itself type for a Go package that
-+// minibp compiles during the bootstrap stage (everything under build/soong/,
-+// build/blueprint/, system/tools/aidl/build/, etc. that ships as part of the
-+// build binary itself). The ninja Soong emits has two statements per package:
-+// a generateSerializers stamp that runs gob codegen over the srcs, and a
-+// compile of the srcs (plus dep .a archives) into pkg/<pkgPath>.a.
-+//
-+// What the emitter captures here:
-+//
-+//   - pkgPath is the install path under out/host/linux-x86/bin/go/<name>/pkg/
-+//     and a key part of the module's identity (two packages with the same name
-+//     but different pkgPath produce distinct .a files).
-+//   - srcs is the canonical list of .go files compiled (testSrcs are emitted
-+//     into the .a too in Soong's host-test-only world; we keep them in their
-+//     own line so a srcs-only edit and a testSrcs-only edit are distinguishable
-+//     in the fragment).
-+//   - deps are other bootstrap_go_package archives that must be on the import
-+//     path; depHashes already captures each dep's resolved identity, so changes
-+//     to a dep's srcs/pkgPath propagate here through the engine.
-+//
-+// The output stanza is content-addressed by the resolved def hash so the
-+// fragment is stable across reorderings; the rule keyword and pkgPath string
-+// match the Soong-emitted rule names so a future textual diff against a real
-+// bootstrap.ninja can be done by simple substring search.
-+func emitBootstrapGoPackage(name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	id := fmt.Sprintf("%016x", hashBytes(resolvedDef))
-+	dep := fmt.Sprintf("%016x", hashBytes(depHashes))
-+	pkgPath := strings.Trim(res.props["pkgPath"], "\"")
-+	if pkgPath == "" {
-+		pkgPath = name
-+	}
-+	srcs := strings.TrimSpace(res.props["srcs"])
-+	testSrcs := strings.TrimSpace(res.props["testSrcs"])
-+
-+	var b bytes.Buffer
-+	fmt.Fprintf(&b, "# module %s (bootstrap_go_package)\n", name)
-+	fmt.Fprintf(&b, "# pkgPath %s\n", pkgPath)
-+	fmt.Fprintf(&b, "build out/host/linux-x86/bin/go/%s/pkg/%s.a: g.bootstrap.compile\n", name, pkgPath)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	if srcs != "" {
-+		fmt.Fprintf(&b, "    srcs = %s\n", srcs)
-+	}
-+	if testSrcs != "" {
-+		fmt.Fprintf(&b, "    test_srcs = %s\n", testSrcs)
-+	}
-+	return b.Bytes()
-+}
-+
-+func init() {
-+	registerEmitter("bootstrap_go_package", emitBootstrapGoPackage)
-+}
-diff --git a/incr/emit_droidstubs.go b/incr/emit_droidstubs.go
-new file mode 100644
-index 0000000..a3ac198
---- /dev/null
-+++ b/incr/emit_droidstubs.go
-@@ -0,0 +1,96 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+import (
-+	"bytes"
-+	"fmt"
-+	"strings"
-+)
-+
-+// droidstubs is the Soong type that invokes metalava over a Java source set
-+// to produce stubs (.srcjar), the API signature file, the removed-api file,
-+// the lint baseline / lint output, and (optionally) an annotations zip.
-+//
-+// What the emitter captures here:
-+//
-+//   - srcs is the Java source set fed to metalava. Reordering or adding a src
-+//     file changes both the stubs jar and the API signature: the resolved def
-+//     hash already captures that, so the engine recomputes only this module
-+//     and its dependents.
-+//   - libs is the classpath. A change to any classpath dep (e.g. a transitive
-+//     defaults edit that adds a lib) reaches us through depHashes.
-+//   - flags is a passthrough of the metalava command-line knobs (--stub-packages,
-+//     --hide, --error etc.); a single-character change here means metalava
-+//     produces different stubs, so it has to be part of the content hash --
-+//     and the canonical-properties layer already ensures that.
-+//   - check_api parameters (api_file / removed_api_file / last_released) are
-+//     part of the resolved def too; we surface their presence so a textual diff
-+//     against the real ninja is recognisable.
-+//
-+// The emitter produces three build statements that mirror Soong's grouping:
-+// stubs.srcjar, api.txt, and a lint stamp. They all share the same content
-+// hash because Soong emits them from a single metalava invocation; using a
-+// shared id keeps a future reverse-lookup ("which droidstubs produced this
-+// .srcjar?") simple.
-+//
-+// Two synthetic variants of this type, droidstubs__loadHookModule and
-+// droidstubs__bottomUpMutatorModule, appear in real Soong .ninja output for
-+// programmatically-created modules; they are registered in their own files so
-+// each variant's registration can carry its own provenance comment.
-+func emitDroidstubs(name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	id := fmt.Sprintf("%016x", hashBytes(resolvedDef))
-+	dep := fmt.Sprintf("%016x", hashBytes(depHashes))
-+	srcs := strings.TrimSpace(res.props["srcs"])
-+	libs := strings.TrimSpace(res.props["libs"])
-+	flags := strings.TrimSpace(res.props["flags"])
-+	hasCheckApi := strings.TrimSpace(res.props["check_api"]) != ""
-+
-+	// Variant tag for the optional load-hook / mutator suffix so the emitted
-+	// fragment is self-describing.
-+	variant := ""
-+	if strings.HasSuffix(res.typ, "__loadHookModule") {
-+		variant = " [loadHookModule]"
-+	} else if strings.HasSuffix(res.typ, "__bottomUpMutatorModule") {
-+		variant = " [bottomUpMutatorModule]"
-+	}
-+
-+	var b bytes.Buffer
-+	fmt.Fprintf(&b, "# module %s (droidstubs%s)\n", name, variant)
-+	fmt.Fprintf(&b, "build out/soong/.intermediates/%s/stubs.srcjar: metalava\n", name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	if srcs != "" {
-+		fmt.Fprintf(&b, "    srcs = %s\n", srcs)
-+	}
-+	if libs != "" {
-+		fmt.Fprintf(&b, "    libs = %s\n", libs)
-+	}
-+	if flags != "" {
-+		fmt.Fprintf(&b, "    flags = %s\n", flags)
-+	}
-+	fmt.Fprintf(&b, "build out/soong/.intermediates/%s/api.txt: metalava_api\n", name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "build out/soong/.intermediates/%s/lint.stamp: metalava_lint\n", name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	if hasCheckApi {
-+		fmt.Fprintf(&b, "    check_api = present\n")
-+	}
-+	return b.Bytes()
-+}
-+
-+func init() {
-+	registerEmitter("droidstubs", emitDroidstubs)
-+}
-diff --git a/incr/emit_droidstubs_bottom_up.go b/incr/emit_droidstubs_bottom_up.go
-new file mode 100644
-index 0000000..c9c89c0
---- /dev/null
-+++ b/incr/emit_droidstubs_bottom_up.go
-@@ -0,0 +1,35 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+// droidstubs__bottomUpMutatorModule is the synthetic type Soong assigns to a
-+// droidstubs instance created by a bottom-up mutator -- see Soong's
-+// android/mutator.go (the createModule path with the "_bottomUpMutatorModule"
-+// variant suffix). Real example: each java_library that opts in to
-+// stubs-source generation gets a companion droidstubs created in a bottom-up
-+// mutator pass; in real ninja output the module_type tag is literally
-+// "droidstubs__bottomUpMutatorModule" (see e.g. the
-+// framework-location.stubs.source modules in build.aosp_cf_x86_64_phone.*.ninja).
-+//
-+// We register the synthetic type as a distinct entry that routes through the
-+// shared emitDroidstubs function (declared in emit_droidstubs.go). The fragment
-+// self-labels the variant from res.typ so a textual diff against the real ninja
-+// still shows the provenance. Routing through one emitter keeps the fragment
-+// shape consistent across the three droidstubs forms; if the mutator-generated
-+// form needs to emit anything extra (e.g. the parent module's name in a comment),
-+// branch inside emitDroidstubs on res.typ rather than fork the function.
-+func init() {
-+	registerEmitter("droidstubs__bottomUpMutatorModule", emitDroidstubs)
-+}
-diff --git a/incr/emit_droidstubs_load_hook.go b/incr/emit_droidstubs_load_hook.go
-new file mode 100644
-index 0000000..10f5fb1
---- /dev/null
-+++ b/incr/emit_droidstubs_load_hook.go
-@@ -0,0 +1,35 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+// droidstubs__loadHookModule is the synthetic type Soong assigns to a droidstubs
-+// instance created by a load hook (Soong's android.AddLoadHook /
-+// AddLoadHookWithDirectory mechanism). The canonical example is
-+// java_sdk_library: its load hook synthesises one or more droidstubs companion
-+// modules so the public/system/module-lib stubs flavours all show up in the
-+// build graph. The variant string flows through into ninja exactly as
-+// "droidstubs__loadHookModule" (see Soong's android/hooks.go and the ninja
-+// tags emitted for these modules), and Soong's neverallow logic explicitly
-+// strips this suffix when checking the underlying module type.
-+//
-+// We register the synthetic type as a distinct entry that routes through the
-+// shared emitDroidstubs function (declared in emit_droidstubs.go). The fragment
-+// self-labels the variant from res.typ so a textual diff against the real
-+// ninja still shows the provenance, and we keep the door open to branching
-+// inside emitDroidstubs if the load-hook variant ever needs to emit something
-+// the top-level form does not.
-+func init() {
-+	registerEmitter("droidstubs__loadHookModule", emitDroidstubs)
-+}
-diff --git a/incr/emit_module_exports.go b/incr/emit_module_exports.go
-new file mode 100644
-index 0000000..6bbda74
---- /dev/null
-+++ b/incr/emit_module_exports.go
-@@ -0,0 +1,115 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+import (
-+	"bytes"
-+	"fmt"
-+	"sort"
-+	"strings"
-+)
-+
-+// module_exports is one of Soong's two snapshot aggregator types (the other
-+// is sdk; see emit_sdk.go). It bundles a list of already-built modules --
-+// java_libs, native_libs, native_binaries, native_shared_libs, native_static_libs,
-+// java_header_libs etc. -- into a self-contained snapshot zip that can be
-+// shipped as a prebuilt to another tree. The canonical use is mainline modules
-+// exporting their host tools for branches that don't build them from source
-+// (art-module-host-exports, i18n-module-host-exports, etc.).
-+//
-+// The Soong ninja for a module_exports has the same shape as for an sdk
-+// (snapshot/ tree of copies, SnapshotZipFiles into a .zip, rawFileCopy into a
-+// .info, then install of both into out/soong/mainline-sdks/). What
-+// distinguishes module_exports from sdk is policy, not shape: module_exports
-+// is the unsealed form that doesn't enforce API compat, while sdk is the
-+// public, API-checked form. The ninja-level emitter therefore mirrors what
-+// the sdk emitter does, just under a module_exports type tag, and the two
-+// share a helper.
-+//
-+// What the emitter captures here:
-+//
-+//   - The aggregator's members: every list-valued export-like property is
-+//     surfaced so the engine's content-addressing covers them. Adding a
-+//     member to a snapshot must invalidate the snapshot; the canonical
-+//     properties layer already folds those values into resolvedDef, so we
-+//     reflect them in the fragment for legibility / textual diffability.
-+//   - The standard outputs: <name>-current.zip and <name>-current.info under
-+//     out/soong/mainline-sdks/, matching the real ninja install paths.
-+//
-+// host_supported is surfaced as a tag so a diff against real ninja recognises
-+// the host-only variants (art-module-host-exports etc.).
-+func emitModuleExports(name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	return emitSnapshotAggregator(name, "module_exports", res, resolvedDef, depHashes)
-+}
-+
-+// emitSnapshotAggregator renders a snapshot-zip ninja fragment for either a
-+// module_exports or an sdk module: same Soong build actions, same install
-+// paths under out/soong/mainline-sdks/, differing only in the type tag and
-+// the surfaced member-list properties.
-+func emitSnapshotAggregator(name, typ string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	id := fmt.Sprintf("%016x", hashBytes(resolvedDef))
-+	dep := fmt.Sprintf("%016x", hashBytes(depHashes))
-+
-+	var b bytes.Buffer
-+	fmt.Fprintf(&b, "# module %s (%s)\n", name, typ)
-+	if v := strings.TrimSpace(res.props["host_supported"]); v != "" {
-+		fmt.Fprintf(&b, "# host_supported %s\n", v)
-+	}
-+
-+	// Surface every membership property in sorted order so the fragment is
-+	// deterministic regardless of map iteration order.
-+	memberKeys := make([]string, 0, len(snapshotMemberProps))
-+	for k := range snapshotMemberProps {
-+		memberKeys = append(memberKeys, k)
-+	}
-+	sort.Strings(memberKeys)
-+	for _, k := range memberKeys {
-+		if v := strings.TrimSpace(res.props[k]); v != "" {
-+			fmt.Fprintf(&b, "    %s = %s\n", k, v)
-+		}
-+	}
-+
-+	fmt.Fprintf(&b, "build out/soong/mainline-sdks/%s-current.zip: g.sdk.SnapshotZipFiles\n", name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	fmt.Fprintf(&b, "build out/soong/mainline-sdks/%s-current.info: g.android.rawFileCopy\n", name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	return b.Bytes()
-+}
-+
-+// snapshotMemberProps lists the property names that name member modules of a
-+// sdk / module_exports snapshot. They are the keys whose values bind the
-+// snapshot's contents; an edit to any of them must regenerate the zip, which
-+// the canonical properties layer already ensures.
-+var snapshotMemberProps = map[string]bool{
-+	"java_libs":              true,
-+	"java_header_libs":       true,
-+	"java_sdk_libs":          true,
-+	"java_systemserver_libs": true,
-+	"java_boot_libs":         true,
-+	"native_libs":            true,
-+	"native_shared_libs":     true,
-+	"native_static_libs":     true,
-+	"native_header_libs":     true,
-+	"native_binaries":        true,
-+	"native_objects":         true,
-+	"bootclasspath_fragments": true,
-+	"systemserverclasspath_fragments": true,
-+	"apexes":                 true,
-+}
-+
-+func init() {
-+	registerEmitter("module_exports", emitModuleExports)
-+}
-diff --git a/incr/emit_sdk.go b/incr/emit_sdk.go
-new file mode 100644
-index 0000000..bddf574
---- /dev/null
-+++ b/incr/emit_sdk.go
-@@ -0,0 +1,43 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+// sdk is the second of Soong's two snapshot aggregator types (the first is
-+// module_exports; see emit_module_exports.go). Unlike module_exports, an sdk
-+// is API-checked: its java_sdk_libs / native_libs / bootclasspath_fragments
-+// have stable interfaces and the snapshot ships the public API surface, so
-+// downstream branches can build against the prebuilt snapshot without source.
-+// Canonical examples: art-module-sdk, i18n-module-sdk, conscrypt-module-sdk,
-+// each one defined alongside a matching module_exports in the same Android.bp.
-+//
-+// The ninja Soong emits for an sdk module has the SAME shape as for a
-+// module_exports -- a snapshot/ tree of file copies, a SnapshotZipFiles into
-+// the current.zip, a rawFileCopy of the current.info, and installs of both
-+// under out/soong/mainline-sdks/. The two diverge in API-enforcement policy
-+// (Soong-side compat checking), not in ninja-level emission. So this emitter
-+// reuses emitSnapshotAggregator from emit_module_exports.go and merely
-+// supplies "sdk" as the type tag; the canonical-properties layer already
-+// covers any sdk-specific properties (traits, prefer_stable, etc.) by hashing
-+// them into the resolved def.
-+//
-+// Surfaces host_supported and every member-list property, in sorted order, so
-+// the fragment is deterministic regardless of map iteration.
-+func emitSdk(name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	return emitSnapshotAggregator(name, "sdk", res, resolvedDef, depHashes)
-+}
-+
-+func init() {
-+	registerEmitter("sdk", emitSdk)
-+}
-diff --git a/incr/emitters.go b/incr/emitters.go
-new file mode 100644
-index 0000000..4e2d861
---- /dev/null
-+++ b/incr/emitters.go
-@@ -0,0 +1,68 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+// Native emitters. The gen:<path>/<name> query asks the resolved module what
-+// its type is and dispatches to a per-type EmitFunc, which returns the ninja
-+// fragment for that one module. Each emitter is a pure function of the resolved
-+// def + the direct deps' resolved hashes; the engine's content-addressing then
-+// guarantees that a warm rebuild reuses the cached fragment unless the
-+// function's inputs actually changed, and recomputed fragments early-cut off
-+// when the bytes are unchanged.
-+//
-+// Why per-type: a generic phony stamp is enough to prove the engine, but real
-+// Soong emits radically different ninja for, say, droidstubs (metalava
-+// invocation, stubs/api/lint outputs) vs blueprint_go_binary (compile+link of
-+// a host go program). A per-type emitter lets the warm path produce the SAME
-+// ninja a cold build would, at the granularity Soong actually rebuilds at.
-+//
-+// Adding a new type: write `func emitFoo(...) []byte`, register it in
-+// emitterTable below keyed on the .bp type string. If a module type appears
-+// programmatically with the suffix "__loadHookModule" or "__bottomUpMutatorModule"
-+// (i.e. created by a load hook or a bottom-up mutator instead of a top-level
-+// .bp stanza), register the suffixed variant explicitly: it is a distinct
-+// Soong module type, even though it shares the underlying factory.
-+
-+// EmitFunc produces the ninja fragment for one module. name is the module's
-+// declared name, res is the merged (post-defaults) resolved def, resolvedDef is
-+// the canonical bytes of res that the engine content-hashes, and depHashes is
-+// the concatenation of each direct dep's resolvedDef bytes.
-+type EmitFunc func(name string, res *resolved, resolvedDef, depHashes []byte) []byte
-+
-+// emitterTable maps a .bp module type to its native emitter. Keys are exact
-+// type strings (including any "__loadHookModule" / "__bottomUpMutatorModule"
-+// synthetic suffix Soong appends to programmatically-created modules).
-+var emitterTable = map[string]EmitFunc{}
-+
-+// registerEmitter installs an EmitFunc for a given module type. Panics if the
-+// type already has an emitter, so that two source files do not silently shadow
-+// each other.
-+func registerEmitter(typ string, fn EmitFunc) {
-+	if _, ok := emitterTable[typ]; ok {
-+		panic("incr: duplicate emitter for type " + typ)
-+	}
-+	emitterTable[typ] = fn
-+}
-+
-+// emit dispatches to the registered EmitFunc for typ, falling back to the
-+// generic phony stamp if no native emitter is registered. The fallback is what
-+// keeps the engine able to analyze a tree containing types we haven't written
-+// emitters for yet -- we lose per-type granularity but keep correctness.
-+func emit(typ, name string, res *resolved, resolvedDef, depHashes []byte) []byte {
-+	if fn, ok := emitterTable[typ]; ok {
-+		return fn(name, res, resolvedDef, depHashes)
-+	}
-+	return genericEmit(name, resolvedDef, depHashes)
-+}
-diff --git a/incr/engine.go b/incr/engine.go
-new file mode 100644
-index 0000000..37195d2
---- /dev/null
-+++ b/incr/engine.go
-@@ -0,0 +1,230 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+// Package incr is a content-addressed, demand-driven incremental computation
-+// engine (the Salsa / Adapton / Buck2-DICE model) for build analysis.
-+//
-+// The premise that motivates it: today's Soong analysis is not correct-by-
-+// construction, so an incremental ("warm") re-derive cannot be trusted to match
-+// a cold build. That forces a faithfulness self-check and, when it fails (any
-+// non-trivial frameworks/base edit), a full cold fallback that costs minutes.
-+//
-+// This engine removes the need for both. Every derivation is a pure query keyed
-+// on the content of its inputs; the engine records, per query, exactly which
-+// other queries it read; on an edit it recomputes only the queries whose inputs
-+// actually changed, with EARLY CUTOFF (if a recomputed query produces the same
-+// content hash, its dependents are not recomputed). The warm result therefore
-+// equals the cold result BY CONSTRUCTION -- there is no self-check and no
-+// fallback, and the recompute cost is O(edit), not O(tree).
-+package incr
-+
-+import (
-+	"fmt"
-+	"hash/fnv"
-+)
-+
-+// Key identifies a query instance, e.g. "parse:frameworks/base/Android.bp" or
-+// "gen:frameworks/base/Android.bp/framework-ike-shared-srcs".
-+type Key string
-+
-+// Result is what a query produces. Bytes is the canonical content: it is what
-+// the engine hashes for content-addressing, and for terminal queries (ninja
-+// fragments) it is also the output. Data is an optional structured payload that
-+// downstream queries may read without re-serializing.
-+type Result struct {
-+	Bytes []byte
-+	Data  interface{}
-+}
-+
-+// QueryFunc computes a Result, demanding other queries via ctx.Get (which
-+// records the dependency edge automatically). It must be a pure function of the
-+// queries it reads -- no ambient I/O, clock, or global state.
-+type QueryFunc func(ctx *Ctx) (Result, error)
-+
-+type node struct {
-+	key      Key
-+	fn       QueryFunc // nil => input (leaf) node
-+	res      Result
-+	hash     uint64
-+	deps     []Key
-+
-+	// changedAt is the revision at which this node's content hash last changed.
-+	// verifiedAt is the revision at which we last confirmed the node is current.
-+	// A derived node is stale iff some dependency's changedAt is newer than this
-+	// node's verifiedAt -- the standard Salsa red/green invariant.
-+	changedAt  uint64
-+	verifiedAt uint64
-+	computed   bool
-+}
-+
-+// Engine holds the memo table and the global revision clock.
-+type Engine struct {
-+	nodes     map[Key]*node
-+	resolvers []func(Key) (QueryFunc, bool)
-+	revision  uint64
-+
-+	// Per-Build stats (reset at the start of each Build).
-+	Recomputed int // queries whose function actually ran
-+	Cutoff     int // ran but produced an identical hash (dependents spared)
-+	Verified   int // confirmed current without running
-+}
-+
-+func New() *Engine { return &Engine{nodes: map[Key]*node{}} }
-+
-+// Register installs the function for a derived query key.
-+func (e *Engine) Register(key Key, fn QueryFunc) {
-+	n := e.nodes[key]
-+	if n == nil {
-+		n = &node{key: key}
-+		e.nodes[key] = n
-+	}
-+	n.fn = fn
-+}
-+
-+// AddResolver installs a handler that lazily materializes derived queries whose
-+// keys are not pre-registered (e.g. "gen:<file>/<name>" for any module). This is
-+// what lets a newly added module be analyzed without re-registering anything.
-+func (e *Engine) AddResolver(r func(Key) (QueryFunc, bool)) {
-+	e.resolvers = append(e.resolvers, r)
-+}
-+
-+func hashBytes(b []byte) uint64 {
-+	h := fnv.New64a()
-+	h.Write(b)
-+	return h.Sum64()
-+}
-+
-+// SetInput sets the content of an input (leaf) query. It bumps the global
-+// revision and marks the input changed iff its content actually differs, so a
-+// no-op re-set is free.
-+func (e *Engine) SetInput(key Key, content []byte) {
-+	n := e.nodes[key]
-+	h := hashBytes(content)
-+	if n != nil && n.computed && n.fn == nil && n.hash == h {
-+		return // identical content -> not a change
-+	}
-+	if n == nil {
-+		n = &node{key: key}
-+		e.nodes[key] = n
-+	}
-+	e.revision++
-+	n.fn = nil
-+	n.res = Result{Bytes: content}
-+	n.hash = h
-+	n.changedAt = e.revision
-+	n.verifiedAt = e.revision
-+	n.computed = true
-+}
-+
-+// Ctx is handed to a QueryFunc; Get demands another query and records the edge.
-+type Ctx struct {
-+	e    *Engine
-+	deps []Key
-+}
-+
-+// Get demands the value of another query, recording a dependency on it.
-+func (c *Ctx) Get(key Key) (Result, error) {
-+	c.deps = append(c.deps, key)
-+	n, err := c.e.bring(key)
-+	if err != nil {
-+		return Result{}, err
-+	}
-+	return n.res, nil
-+}
-+
-+// Build brings target (and transitively its dependencies) up to date at the
-+// current revision and returns its Result. Only queries whose inputs actually
-+// changed since the last Build are recomputed.
-+func (e *Engine) Build(target Key) (Result, error) {
-+	e.Recomputed, e.Cutoff, e.Verified = 0, 0, 0
-+	n, err := e.bring(target)
-+	if err != nil {
-+		return Result{}, err
-+	}
-+	return n.res, nil
-+}
-+
-+func (e *Engine) lookup(key Key) *node {
-+	if n := e.nodes[key]; n != nil {
-+		return n
-+	}
-+	for _, r := range e.resolvers {
-+		if fn, ok := r(key); ok {
-+			n := &node{key: key, fn: fn}
-+			e.nodes[key] = n
-+			return n
-+		}
-+	}
-+	return nil
-+}
-+
-+func (e *Engine) bring(key Key) (*node, error) {
-+	n := e.lookup(key)
-+	if n == nil {
-+		return nil, fmt.Errorf("incr: no such query %q", key)
-+	}
-+	// Already confirmed current this revision (the per-build memo).
-+	if n.computed && n.verifiedAt == e.revision {
-+		e.Verified++
-+		return n, nil
-+	}
-+	// Inputs are current by definition once set.
-+	if n.fn == nil {
-+		n.verifiedAt = e.revision
-+		return n, nil
-+	}
-+	// Derived: verify dependencies and find the newest dependency change.
-+	if n.computed {
-+		var maxDepChanged uint64
-+		for _, dk := range n.deps {
-+			dn, err := e.bring(dk)
-+			if err != nil {
-+				return nil, err
-+			}
-+			if dn.changedAt > maxDepChanged {
-+				maxDepChanged = dn.changedAt
-+			}
-+		}
-+		if maxDepChanged <= n.verifiedAt {
-+			// No dependency changed since we last verified this query: still good.
-+			n.verifiedAt = e.revision
-+			e.Verified++
-+			return n, nil
-+		}
-+	}
-+	// Recompute. The function re-declares its dependencies via ctx.Get.
-+	ctx := &Ctx{e: e}
-+	res, err := n.fn(ctx)
-+	if err != nil {
-+		return nil, err
-+	}
-+	e.Recomputed++
-+	h := hashBytes(res.Bytes)
-+	n.deps = ctx.deps
-+	prevHash, wasComputed := n.hash, n.computed
-+	n.res = res
-+	n.computed = true
-+	n.verifiedAt = e.revision
-+	if wasComputed && h == prevHash {
-+		// EARLY CUTOFF: identical content, so dependents need not recompute.
-+		e.Cutoff++
-+	} else {
-+		n.hash = h
-+		n.changedAt = e.revision
-+	}
-+	return n, nil
-+}
-+
-+// NodeCount returns the number of materialized query nodes (for diagnostics).
-+func (e *Engine) NodeCount() int { return len(e.nodes) }
-diff --git a/incr/pipeline.go b/incr/pipeline.go
-new file mode 100644
-index 0000000..76728f1
---- /dev/null
-+++ b/incr/pipeline.go
-@@ -0,0 +1,376 @@
-+// Copyright 2026 Google Inc. All rights reserved.
-+//
-+// Licensed under the Apache License, Version 2.0 (the "License");
-+// you may not use this file except in compliance with the License.
-+// You may obtain a copy of the License at
-+//
-+//     http://www.apache.org/licenses/LICENSE-2.0
-+//
-+// Unless required by applicable law or agreed to in writing, software
-+// distributed under the License is distributed on an "AS IS" BASIS,
-+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-+// See the License for the specific language governing permissions and
-+// limitations under the License.
-+
-+package incr
-+
-+import (
-+	"bytes"
-+	"fmt"
-+	"os"
-+	"sort"
-+	"strings"
-+
-+	"github.com/google/blueprint/parser"
-+)
-+
-+func readFileBytes(path string) ([]byte, error) { return os.ReadFile(path) }
-+
-+// The pipeline wires a real .bp -> ninja analysis onto the engine as pure,
-+// content-addressed queries. Query keys:
-+//
-+//   file:<path>            input: the raw bytes of an Android.bp file.
-+//   parse:<path>           parse <path> into name -> parsed module. Depends on
-+//                          file:<path>.
-+//   mod:<path>/<name>      one module's RAW canonical def (pre-defaults), sliced
-+//                          out of parse:<path>. Depends on parse:<path>; its hash
-+//                          changes only when THAT module's own text changes.
-+//   resolved:<path>/<name> the module's def after MERGING its `defaults:` modules
-+//                          (defaults are the base; the module overrides). Depends
-+//                          on mod:<path>/<name> and resolved:<...> of each default
-+//                          -- a real cross-module edge. Editing a widely-used
-+//                          defaults module re-resolves only its users (early
-+//                          cutoff stops anything whose merged result is unchanged).
-+//   gen:<path>/<name>      the ninja fragment for one module, names content-
-+//                          addressed. Depends on resolved:<path>/<name>.
-+//   manifest               concatenation of all gen fragments in (path,name)
-+//                          order.
-+//
-+// Correct-by-construction: names are hashes of the module's resolved identity,
-+// the canonical encoding sorts property keys, and assembly sorts by (path,name).
-+// A warm rebuild after an edit is byte-identical to a cold build of the edited
-+// tree -- no faithfulness check, no fallback.
-+
-+const (
-+	filePrefix  = "file:"
-+	parsePrefix = "parse:"
-+	modPrefix   = "mod:"
-+	resPrefix   = "resolved:"
-+	genPrefix   = "gen:"
-+	manifestKey = "manifest"
-+)
-+
-+// pmod is a parsed module: its canonical own-property text (keys sorted, value
-+// order preserved), the names listed in its `defaults:` property, and the module
-+// names it depends on (from *_libs etc. and ":name" srcs references).
-+type pmod struct {
-+	canon    string            // "type{key:val;...}" of the module's OWN properties
-+	props    map[string]string // key -> canonical value, for merging
-+	typ      string
-+	defaults []string
-+	deps     []string
-+}
-+
-+// resolved is the result of a resolved:<module> query: the merged property map
-+// (after defaults), the merged dependency name list, and the module's type
-+// (which the gen layer dispatches on to pick a native emitter).
-+type resolved struct {
-+	typ   string
-+	props map[string]string
-+	deps  []string
-+}
-+
-+// depProps are the list-valued properties whose entries name other modules.
-+var depProps = map[string]bool{
-+	"static_libs": true, "libs": true, "shared_libs": true, "whole_static_libs": true,
-+	"header_libs": true, "runtime_libs": true, "system_shared_libs": true,
-+	"plugins": true, "required": true, "exported_plugins": true,
-+}
-+
-+// Pipeline registers the queries for a fixed set of .bp files on an engine.
-+type Pipeline struct {
-+	e          *Engine
-+	files      []string
-+	nameToFile map[string]string // module name -> defining file (for dep resolution)
-+}
-+
-+// NewPipeline registers file/parse queries and the lazy mod:/resolved:/gen:
-+// resolvers plus the manifest query. It first does a one-time plain parse to map
-+// each module name to its file so defaults can be resolved across files.
-+func NewPipeline(e *Engine, files []string) *Pipeline {
-+	p := &Pipeline{e: e, files: append([]string(nil), files...), nameToFile: map[string]string{}}
-+	sort.Strings(p.files)
-+
-+	// One-time index: module name -> file. (A real backend would maintain this as
-+	// its own incremental query; static is fine for the demo's fixed file set.)
-+	for _, f := range p.files {
-+		if b, err := readFileBytes(f); err == nil {
-+			for name := range parseModules(f, b) {
-+				p.nameToFile[name] = f
-+			}
-+		}
-+	}
-+
-+	for _, f := range p.files {
-+		path := f
-+		e.Register(Key(parsePrefix+path), func(ctx *Ctx) (Result, error) {
-+			src, err := ctx.Get(Key(filePrefix + path))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			return parseFile(path, src.Bytes)
-+		})
-+	}
-+
-+	// mod:<path>/<name> -- one module's raw (pre-defaults) canonical def.
-+	e.AddResolver(func(k Key) (QueryFunc, bool) {
-+		if !strings.HasPrefix(string(k), modPrefix) {
-+			return nil, false
-+		}
-+		path, name := splitPathName(string(k)[len(modPrefix):])
-+		return func(ctx *Ctx) (Result, error) {
-+			pr, err := ctx.Get(Key(parsePrefix + path))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			m, ok := pr.Data.(map[string]*pmod)[name]
-+			if !ok {
-+				return Result{}, fmt.Errorf("module %q not in %s", name, path)
-+			}
-+			return Result{Bytes: []byte(m.canon), Data: m}, nil
-+		}, true
-+	})
-+
-+	// resolved:<path>/<name> -- the module after merging its defaults modules.
-+	e.AddResolver(func(k Key) (QueryFunc, bool) {
-+		if !strings.HasPrefix(string(k), resPrefix) {
-+			return nil, false
-+		}
-+		path, name := splitPathName(string(k)[len(resPrefix):])
-+		return func(ctx *Ctx) (Result, error) {
-+			mr, err := ctx.Get(Key(modPrefix + path + "/" + name))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			m := mr.Data.(*pmod)
-+			// Merge: defaults are the base (in listed order), module overrides.
-+			merged := map[string]string{}
-+			var deps []string
-+			for _, d := range m.defaults {
-+				df, ok := p.nameToFile[d]
-+				if !ok {
-+					continue // unknown defaults module: skip (matches lenient soong)
-+				}
-+				dr, err := ctx.Get(Key(resPrefix + df + "/" + d))
-+				if err != nil {
-+					return Result{}, err
-+				}
-+				rd := dr.Data.(*resolved)
-+				for k2, v := range rd.props {
-+					merged[k2] = v
-+				}
-+				deps = append(deps, rd.deps...)
-+			}
-+			for k2, v := range m.props {
-+				merged[k2] = v // module's own props override defaults
-+			}
-+			deps = append(deps, m.deps...)
-+			return Result{Bytes: []byte(canonProps(m.typ, merged)), Data: &resolved{typ: m.typ, props: merged, deps: deps}}, nil
-+		}, true
-+	})
-+
-+	// gen:<path>/<name> -- ninja fragment from the RESOLVED module AND its direct
-+	// deps' resolved identities (a module's build action reflects what it links
-+	// against), so editing a library propagates to its dependents -- scoped to the
-+	// reverse-dep closure, with early cutoff when a dep's resolved is unchanged.
-+	e.AddResolver(func(k Key) (QueryFunc, bool) {
-+		if !strings.HasPrefix(string(k), genPrefix) {
-+			return nil, false
-+		}
-+		path, name := splitPathName(string(k)[len(genPrefix):])
-+		return func(ctx *Ctx) (Result, error) {
-+			rr, err := ctx.Get(Key(resPrefix + path + "/" + name))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			res := rr.Data.(*resolved)
-+			var depHashes []byte
-+			for _, d := range res.deps {
-+				df, ok := p.nameToFile[d]
-+				if !ok {
-+					continue
-+				}
-+				dr, err := ctx.Get(Key(resPrefix + df + "/" + d))
-+				if err != nil {
-+					return Result{}, err
-+				}
-+				depHashes = append(depHashes, dr.Bytes...)
-+			}
-+			return Result{Bytes: emit(res.typ, name, res, rr.Bytes, depHashes)}, nil
-+		}, true
-+	})
-+
-+	e.Register(Key(manifestKey), func(ctx *Ctx) (Result, error) {
-+		type ref struct{ path, name string }
-+		var refs []ref
-+		for _, f := range p.files {
-+			pr, err := ctx.Get(Key(parsePrefix + f))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			for name := range pr.Data.(map[string]*pmod) {
-+				refs = append(refs, ref{f, name})
-+			}
-+		}
-+		sort.Slice(refs, func(i, j int) bool {
-+			if refs[i].path != refs[j].path {
-+				return refs[i].path < refs[j].path
-+			}
-+			return refs[i].name < refs[j].name
-+		})
-+		var buf bytes.Buffer
-+		for _, r := range refs {
-+			frag, err := ctx.Get(Key(genPrefix + r.path + "/" + r.name))
-+			if err != nil {
-+				return Result{}, err
-+			}
-+			buf.Write(frag.Bytes)
-+		}
-+		return Result{Bytes: buf.Bytes()}, nil
-+	})
-+
-+	return p
-+}
-+
-+// SetFile feeds the current bytes of a .bp file into the engine.
-+func (p *Pipeline) SetFile(path string, content []byte) {
-+	p.e.SetInput(Key(filePrefix+path), content)
-+}
-+
-+func splitPathName(s string) (path, name string) {
-+	i := strings.LastIndex(s, "/")
-+	if i < 0 {
-+		return s, ""
-+	}
-+	return s[:i], s[i+1:]
-+}
-+
-+// parseFile parses a real Android.bp into a deterministic name -> *pmod map.
-+func parseFile(path string, content []byte) (Result, error) {
-+	defs := parseModules(path, content)
-+	if defs == nil {
-+		return Result{}, fmt.Errorf("parse %s failed", path)
-+	}
-+	// Canonical bytes for hashing the whole file: sorted "name=canon" lines.
-+	names := make([]string, 0, len(defs))
-+	for n := range defs {
-+		names = append(names, n)
-+	}
-+	sort.Strings(names)
-+	var buf bytes.Buffer
-+	for _, n := range names {
-+		buf.WriteString(n)
-+		buf.WriteByte('=')
-+		buf.WriteString(defs[n].canon)
-+		buf.WriteByte('\n')
-+	}
-+	return Result{Bytes: buf.Bytes(), Data: defs}, nil
-+}
-+
-+// parseModules parses a .bp and returns name -> *pmod (nil on parse error).
-+func parseModules(path string, content []byte) map[string]*pmod {
-+	file, errs := parser.Parse(path, bytes.NewReader(content))
-+	if len(errs) > 0 {
-+		return nil
-+	}
-+	out := make(map[string]*pmod)
-+	for _, d := range file.Defs {
-+		m, ok := d.(*parser.Module)
-+		if !ok {
-+			continue
-+		}
-+		name := ""
-+		props := map[string]string{}
-+		var defaults []string
-+		var deps []string
-+		for _, prop := range m.Properties {
-+			if prop.Name == "name" {
-+				if s, ok := prop.Value.(*parser.String); ok {
-+					name = s.Value
-+				}
-+			}
-+			if prop.Name == "defaults" {
-+				if l, ok := prop.Value.(*parser.List); ok {
-+					for _, e := range l.Values {
-+						if s, ok := e.(*parser.String); ok {
-+							defaults = append(defaults, s.Value)
-+						}
-+					}
-+				}
-+			}
-+			if depProps[prop.Name] {
-+				if l, ok := prop.Value.(*parser.List); ok {
-+					for _, e := range l.Values {
-+						if s, ok := e.(*parser.String); ok {
-+							deps = append(deps, s.Value)
-+						}
-+					}
-+				}
-+			}
-+			if prop.Name == "srcs" {
-+				if l, ok := prop.Value.(*parser.List); ok {
-+					for _, e := range l.Values {
-+						if s, ok := e.(*parser.String); ok && strings.HasPrefix(s.Value, ":") {
-+							deps = append(deps, strings.TrimPrefix(s.Value, ":"))
-+						}
-+					}
-+				}
-+			}
-+			props[prop.Name] = strings.Join(strings.Fields(prop.Value.String()), " ")
-+		}
-+		if name == "" {
-+			continue
-+		}
-+		out[name] = &pmod{canon: canonProps(m.Type, props), props: props, typ: m.Type, defaults: defaults, deps: deps}
-+	}
-+	return out
-+}
-+
-+// canonProps renders "type{key:val;key:val;...}" with property keys sorted and
-+// each value's own textual order preserved.
-+func canonProps(typ string, props map[string]string) string {
-+	keys := make([]string, 0, len(props))
-+	for k := range props {
-+		keys = append(keys, k)
-+	}
-+	sort.Strings(keys)
-+	var b strings.Builder
-+	b.WriteString(typ)
-+	b.WriteByte('{')
-+	for i, k := range keys {
-+		if i > 0 {
-+			b.WriteByte(';')
-+		}
-+		b.WriteString(k)
-+		b.WriteByte(':')
-+		b.WriteString(props[k])
-+	}
-+	b.WriteByte('}')
-+	return b.String()
-+}
-+
-+// genericEmit produces the fallback ninja fragment used for any module type
-+// without a dedicated native emitter. The output name is CONTENT-ADDRESSED: the
-+// stamp is keyed on the module's resolved def, not on visitation order or an
-+// accumulating counter -- the structural fix for the dedup / namespace
-+// nondeterminism that defeats Soong's warm path.
-+func genericEmit(name string, resolvedDef, depHashes []byte) []byte {
-+	id := fmt.Sprintf("%016x", hashBytes(resolvedDef))
-+	dep := fmt.Sprintf("%016x", hashBytes(depHashes))
-+	var b bytes.Buffer
-+	fmt.Fprintf(&b, "# module %s\n", name)
-+	fmt.Fprintf(&b, "build out/m_%s/%s.stamp: phony\n", id, name)
-+	fmt.Fprintf(&b, "    def_hash = %s\n", id)
-+	fmt.Fprintf(&b, "    deps_hash = %s\n", dep)
-+	return b.Bytes()
-+}
+-				}
+-			}
+-			return false
+-		})
+-
+-	return &localBuildActions{buildDefs: phonys}
++	if !c.residentNinjaLayout() {
++		// Non-resident (stock) build: use upstream's registration-based dedup verbatim,
++		// so the default build's order-only phonys and the orderOnlyStringsCache are
++		// byte-identical to upstream (and the upstream dedup unit tests pass). The
++		// resident recompute below is only needed because a warm targeted rebuild
++		// re-emits build defs for dirty modules only, leaving the registration map
++		// (c.orderOnlyStrings, populated in module_ctx.go) incomplete -- so the
++		// resident path recounts from each def's immutable OrderOnlyOriginal instead.
++		return c.deduplicateOrderOnlyDepsStock(modules)
++	}
++	return c.deduplicateOrderOnlyDepsResident(modules)
+ }
+ 
+ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 diff --git a/incremental.go b/incremental.go
 index ad27b1f..13d31aa 100644
 --- a/incremental.go
@@ -3398,10 +1022,10 @@ index ad27b1f..13d31aa 100644
  		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 diff --git a/incremental_mutation.go b/incremental_mutation.go
 new file mode 100644
-index 0000000..604b916
+index 0000000..77bd919
 --- /dev/null
 +++ b/incremental_mutation.go
-@@ -0,0 +1,1868 @@
+@@ -0,0 +1,1869 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -4399,6 +2023,7 @@ index 0000000..604b916
 +	c.regeneratedModules = nil
 +	c.posShiftedModules = map[*moduleInfo]bool{}
 +	c.forcedDirtyShards = nil
++	c.orderOnlyDirtyModules = nil
 +	c.incrementalAddedModules = nil
 +	// Keep the previous full build's complete liveGlobals so package-variable
 +	// naming (makeUniquePackageNames) is computed over the SAME package set as a
@@ -6918,6 +4543,952 @@ index 0000000..6e0960c
 +			n, n*2, coldDur, remutDur+genDur, remutDur, genDur, writeDur)
 +	}
 +}
+diff --git a/incremental_ninja.go b/incremental_ninja.go
+new file mode 100644
+index 0000000..10ccb7d
+--- /dev/null
++++ b/incremental_ninja.go
+@@ -0,0 +1,940 @@
++// Copyright 2024 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// This file holds the warm-incremental ("resident soong_build") additions to
++// *Context: graph-residency reuse, targeted/membership-change regeneration, the
++// content-addressed ninja shard layout, and the O(edit) delta write. It is kept
++// separate from context.go so the feature stays additive -- context.go carries
++// only struct fields and thin call-sites into these helpers -- which minimizes
++// merge conflicts when rebasing onto a newer upstream Blueprint. Everything here
++// is gated at runtime by residentNinjaLayout()/keepPristineModules, so a
++// non-resident build behaves exactly like upstream.
++
++package blueprint
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/binary"
++	"fmt"
++	"hash/fnv"
++	"io"
++	"os"
++	"reflect"
++	"slices"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/google/blueprint/gobtools"
++	"github.com/google/blueprint/proptools"
++	"github.com/google/blueprint/uniquelist"
++)
++
++// SetBuildActionCache injects a pre-created BuildActionCache (e.g. an in-memory
++// cache reused across builds by a resident soong_build server) instead of
++// letting PrepareBuildActions open the on-disk cache lazily. It also wires up
++// the EncContext, which PrepareBuildActions would otherwise initialize in the
++// same lazy block. Must be called before PrepareBuildActions.
++func (c *Context) SetBuildActionCache(cache *BuildActionCache) {
++	c.buildActionsCache = cache
++	c.EncContext = gobtools.NewEncContext(cache.referencesDb)
++}
++
++// DependenciesReady reports whether ResolveDependencies (parse + dep resolution
++// + mutators + variant creation) has already completed on this Context. A
++// resident server uses this to decide whether the resolved+mutated graph can be
++// reused for an incremental re-analysis (graph residency).
++func (c *Context) DependenciesReady() bool {
++	return c.dependenciesReady
++}
++
++// ResetBuildActionsForReanalysis clears the per-module build actions generated by
++// the previous PrepareBuildActions pass, while preserving the resolved
++// dependency graph and module variants (dependenciesReady stays true). After
++// calling this, PrepareBuildActions can be run again on the same Context and
++// will skip ResolveDependencies (the ~34.5s phase on a full tree), only
++// re-generating build actions -- this is the core of "graph residency".
++//
++// EXPERIMENTAL / INCOMPLETE: this does NOT re-parse changed Android.bp files or
++// re-run mutators, so modules are regenerated from the property state captured
++// during the last full analysis. It is therefore only correct when the resolved
++// graph is unchanged (same module set, same dependencies/variants) AND edited
++// properties are re-applied to the module property structs by the caller before
++// regeneration. Structural edits (added/removed modules or deps, or changes to
++// mutator-consumed properties) must fall back to a fresh Context. Callers must
++// gate this behind that safety check and byte-verify the resulting ninja.
++func (c *Context) ResetBuildActionsForReanalysis() {
++	parallelVisit(c.iterateAllVariants(), unorderedVisitorImpl{}, parallelVisitLimit,
++		func(module *moduleInfo, pause pauseFunc) bool {
++			c.resetModuleBuildActions(module)
++			return false
++		})
++	c.buildActionsReady = false
++}
++
++// resetModuleBuildActions restores a single module to its pristine, pre-generate
++// state so its GenerateBuildActions can be run again on the resident Context.
++func (c *Context) resetModuleBuildActions(module *moduleInfo) {
++	// Module.GenerateBuildActions is single-use: a logicModule that already
++	// generated build actions caches internal state and cannot be run again.
++	// Restore a fresh logicModule from the pristine pre-generate snapshot captured
++	// in cloneModules, so the next generate pass runs on a clean object. (Cloning
++	// the post-generate module instead would fail, because GenerateBuildActions can
++	// append to the properties slice.)
++	module.logicModule, module.properties = c.restorePristineLogicModule(module)
++	module.logicModule.setInfo(module)
++
++	// Some module implementations cache generate-time state in non-property fields
++	// that CopyProperties does not reset (e.g. SingletonModule's single-variant
++	// guard), and a few factories return a shared instance rather than a fresh
++	// object. Give such modules a chance to clear that state before regeneration.
++	if r, ok := module.logicModule.(interface{ ResetBuildActionsState() }); ok {
++		r.ResetBuildActionsState()
++	}
++
++	module.actionDefs = localBuildActions{}
++	module.buildParams = nil
++	module.startedGenerateBuildActions = false
++	module.finishedGenerateBuildActions = false
++	// Restore the post-mutator provider state: keep providers set by mutators
++	// (which the regenerate pass does not re-run) and drop generate-set ones so the
++	// regenerate pass can set them again without a double-set. The values and the
++	// initial-value hashes are rebuilt by generate as needed.
++	module.providerInfo = providerInfo{
++		providers: append([]interface{}(nil), module.pristineProviders...),
++	}
++	// Drop per-module incremental bookkeeping (cache key, input hash, restored
++	// providers/globs); it is recomputed during regeneration.
++	module.incrementalInfo = incrementalInfo{}
++	// Keep modules live across regenerations. FreeModuleAfterGenerateBuildActions
++	// nils logicModule after generate (a memory optimization); if left set, the
++	// regenerate pass would re-free modules mid-flight and a dependent module would
++	// then visit a nil dependency. The resident graph keeps modules in memory
++	// anyway, so disabling the free is both correct and desirable. Also clear the
++	// proxy name caches, which are only populated when a module is freed.
++	module.freeAfterGenerateBuildActions = false
++	module.cachedName = ""
++	module.cachedString = ""
++	module.cachedUniqueName = ""
++}
++
++// MarkModulesDirty configures the Context for a targeted incremental regenerate.
++// The named modules and their transitive reverse-dependency closure are marked
++// dirty and reset to pristine; a following PrepareBuildActions regenerates only
++// those (generateModuleBuildActions skips clean modules) and keeps every clean
++// module's existing build actions and globals. This is the minimal-work path:
++// only the modules whose inputs changed (plus dependents that may read their
++// changed providers) are re-run. Returns the number of dirty module variants.
++//
++// The reverse-dependency closure is conservative (every transitive dependent),
++// which is always correct; provider-hash comparison can prune it later so that
++// dependents whose inputs did not actually change are left clean.
++func (c *Context) MarkModulesDirty(changedModuleNames []string) int {
++	changed := make(map[string]bool, len(changedModuleNames))
++	for _, n := range changedModuleNames {
++		changed[n] = true
++	}
++
++	dirty := map[*moduleInfo]bool{}
++	var worklist []*moduleInfo
++	for module := range c.iterateAllVariants() {
++		if changed[module.group.name] && !dirty[module] {
++			dirty[module] = true
++			worklist = append(worklist, module)
++		}
++	}
++	for len(worklist) > 0 {
++		m := worklist[len(worklist)-1]
++		worklist = worklist[:len(worklist)-1]
++		for _, rdep := range m.reverseDeps {
++			if !dirty[rdep] {
++				dirty[rdep] = true
++				worklist = append(worklist, rdep)
++			}
++		}
++	}
++
++	for m := range dirty {
++		c.resetModuleBuildActions(m)
++	}
++
++	c.dirtyModules = dirty
++	c.preserveLiveGlobals = true
++	c.buildActionsReady = false
++	return len(dirty)
++}
++
++// singletonsNeedRegen reports whether singletons must be regenerated. In a full
++// build (dirtyModules == nil) they always run. In a targeted incremental build
++// singletons run only on a full (cold) build. On a targeted resident rebuild
++// (dirtyModules != nil) they are kept: a singleton is single-use and aggregates
++// state across the whole module set (VisitAllModules + provider reads), so it
++// cannot be faithfully re-run on the resident Context after the fact -- re-running
++// it would double-set its providers and read incomplete state, producing wrong or
++// empty output. Keeping the prior build's singleton actions is correct for the
++// common case where the edit does not change any singleton's inputs. An edit that
++// *does* change a singleton input (e.g. adding an aconfig flag) is not yet handled
++// incrementally and must be caught by the byte-verification gate / fall back to a
++// full build. See docs/resident_incremental_build.md.
++func (c *Context) singletonsNeedRegen() bool {
++	// On a membership change (add/remove) the whole-graph aggregations change, so
++	// singletons must regenerate over the new module set. generateSingletonBuildActions
++	// resets each singleton's single-use generate-state first so the re-run is clean.
++	// A stable-module-set targeted rebuild keeps the prior build's singleton actions.
++	return c.dirtyModules == nil || c.membershipChanged
++}
++
++// incrementalPureAdd reports whether this warm rebuild only added modules (no
++// pre-existing module changed). When true, an additive whole-graph singleton may
++// keep its cached aggregate and fold in only the added modules
++// (VisitAddedModuleProxies) instead of re-running over every module.
++func (c *Context) incrementalPureAdd() bool {
++	if !c.membershipChanged || len(c.incrementalAddedModules) == 0 || c.dirtyModules == nil {
++		return false
++	}
++	added := make(map[*moduleInfo]bool, len(c.incrementalAddedModules))
++	for _, m := range c.incrementalAddedModules {
++		added[m] = true
++	}
++	for m := range c.dirtyModules {
++		if !added[m] {
++			return false
++		}
++	}
++	return true
++}
++
++// NinjaUnchanged reports that a targeted regenerate produced no build-action
++// changes (no dirty modules, hence no module or singleton output changed), so the
++// existing ninja file is still current and does not need to be rewritten. Only
++// meaningful in targeted mode (after MarkModulesDirty).
++func (c *Context) NinjaUnchanged() bool {
++	return c.dirtyModules != nil && len(c.dirtyModules) == 0 && !c.forceNinjaWrite
++}
++
++func (c *Context) SetIncrementalDebugFile(file string) {
++	c.incrementalDebugFile = file
++}
++
++// residentNinjaLayout reports whether this Context is a resident soong_build
++// graph (warm-incremental mode, gated by SetKeepPristineModules). ONLY in that
++// mode does the manifest use the content-addressed shard assignment, the sharded
++// incremental subninja, and the order-only-dedup recompute that together let a
++// later warm rebuild rewrite O(edit) shards and stay byte-identical to a resident
++// cold build. A normal (non-resident) build -- including stock soong_build and
++// every upstream incremental-analysis unit test, none of which set this flag --
++// uses the stock layout, so its output is byte-identical to upstream. This is the
++// load-bearing gate that keeps the warm feature additive: it must never change
++// the default build's output.
++func (c *Context) residentNinjaLayout() bool {
++	return c.keepPristineModules
++}
++
++// restorePristineLogicModule creates a fresh logicModule from the factory and
++// copies in the pristine, pre-generate property snapshot captured by
++// cloneModules. Used by ResetBuildActionsForReanalysis to make a module's
++// GenerateBuildActions runnable again on a resident Context.
++func (c *Context) restorePristineLogicModule(origModule *moduleInfo) (Module, []interface{}) {
++	if origModule.pristineProperties == nil {
++		panic("no pristine properties snapshot for " + origModule.Name() +
++			"; SetKeepPristineModules must be set before analysis for graph-residency reuse")
++	}
++
++	newLogicModule, newProperties := origModule.factory()
++
++	if len(newProperties) != len(origModule.pristineProperties) {
++		panic("mismatched pristine properties array length in " + origModule.Name())
++	}
++
++	for i := range newProperties {
++		dst := reflect.ValueOf(newProperties[i])
++		src := reflect.ValueOf(origModule.pristineProperties[i])
++
++		proptools.CopyProperties(dst, src)
++	}
++
++	return newLogicModule, newProperties
++}
++
++// SetKeepPristineModules makes cloneModules capture a pristine, pre-generate
++// snapshot of every module's properties, which ResetBuildActionsForReanalysis
++// uses to re-run build-action generation on a resident Context. Off by default;
++// only the resident graph-residency reuse path enables it.
++func (c *Context) SetKeepPristineModules(keep bool) {
++	c.keepPristineModules = keep
++}
++
++// EnableModuleNinjaCache turns on the per-module serialized-ninja cache so a warm
++// manifest write re-serializes only dirty modules (O(edit) instead of O(tree)).
++// The resident server enables it; it is kept in memory across builds.
++func (c *Context) EnableModuleNinjaCache() {
++	if c.moduleNinjaCache == nil {
++		c.moduleNinjaCache = make(map[string][]byte)
++	}
++}
++
++// MaybeSnapshotPreMutationState captures the pre-mutation baselines needed for
++// incremental re-mutation, but only in resident mode (keepPristineModules set).
++// It must be called after ParseFileList and before mutators run; RunBlueprint
++// invokes it at the right point. A no-op otherwise.
++func (c *Context) MaybeSnapshotPreMutationState() error {
++	if !c.keepPristineModules {
++		return nil
++	}
++	return c.SnapshotPreMutationState()
++}
++
++// generateOneModule runs GenerateBuildActions for a single module and folds its
++// results into liveGlobals. It records whether the module's exposed provider
++// interface changed (module.interfaceChanged) so dependents can decide to
++// regenerate. Returns the module's ninja file deps and any errors. Shared by the
++// full parallel generate pass and the targeted incremental worklist.
++func (c *Context) generateOneModule(config interface{}, module *moduleInfo, liveGlobals *liveTracker) (ninjaDeps []string, errs []error) {
++	uniqueName := c.nameInterface.UniqueName(newNamespaceContext(module), module.group.name)
++	sanitizedName := toNinjaName(uniqueName)
++	sanitizedVariant := toNinjaName(module.variant.name)
++
++	prefix := moduleNamespacePrefix(sanitizedName + "_" + sanitizedVariant)
++
++	// The parent scope of the moduleContext's local scope gets overridden to be that of the
++	// calling Go package on a per-call basis.  Since the initial parent scope doesn't matter we
++	// just set it to nil.
++	scope := newLocalScope(nil, prefix)
++
++	mctx := &moduleContext{
++		baseModuleContext: baseModuleContext{
++			context: c,
++			config:  config,
++			module:  module,
++		},
++		scope:              scope,
++		handledMissingDeps: module.missingDeps == nil,
++	}
++
++	// Use a deferred call for this, to avoid errors from trying to evaluate the select()
++	// expressions in the configurable values that mctx.evaluator encounters too early.
++	defer func() {
++		if c.moduleDebugDataChannel != nil {
++			c.moduleDebugDataChannel <- getModuleDebugJson(mctx.evaluator, module)
++		}
++		// The evaluator isn't needed anymore. Avoid possibly cyclic ref that may increase gc load.
++		mctx.evaluator = nil
++	}()
++
++	mctx.module.startedGenerateBuildActions = true
++
++	func() {
++		defer func() {
++			if r := recover(); r != nil {
++				in := fmt.Sprintf("GenerateBuildActions for %s", module)
++				if err, ok := r.(panicError); ok {
++					err.addIn(in)
++					mctx.error(err)
++				} else {
++					mctx.error(newPanicErrorf(r, in))
++				}
++			}
++		}()
++		if !mctx.restoreModuleBuildActions() {
++			mctx.module.logicModule.GenerateBuildActions(mctx)
++		}
++	}()
++
++	mctx.module.finishedGenerateBuildActions = true
++
++	// Record whether this module's exposed provider interface changed so dependents
++	// (visited later, bottom-up) can decide to regenerate. Only meaningful during an
++	// incremental pass with a baseline to compare against.
++	if c.dirtyModules != nil && c.incMutation != nil && c.incMutation.interfaceHash != nil {
++		if h, ok := interfaceHashOf(module); ok {
++			old, had := c.incMutation.interfaceHash[moduleIdentity(uniqueName, module.variant.name)]
++			module.interfaceChanged = !had || old != h
++		} else {
++			module.interfaceChanged = true
++		}
++	}
++
++	if len(mctx.errs) > 0 {
++		return nil, mctx.errs
++	}
++
++	if module.missingDeps != nil && !mctx.handledMissingDeps {
++		var merrs []error
++		for _, depName := range module.missingDeps {
++			merrs = append(merrs, c.missingDependencyError(module, depName))
++		}
++		return nil, merrs
++	}
++
++	ninjaDeps = mctx.ninjaFileDeps
++
++	if mctx.module.freeAfterGenerateBuildActions && !c.keepPristineModules {
++		// This module is freed after GenerateBuildActions complete, requiring all future accesses
++		// to go through ModuleProxy instead of the Module.
++		// Cache Module.Name() and Module.String() for future use in ModuleProxy.Name() and ModuleProxy.String()
++		// In resident mode (keepPristineModules) the graph stays in memory for warm
++		// incremental rebuilds; keep logicModule/properties so a later in-place
++		// re-derive can resolve dependencies through this module (AddDependency ->
++		// transition resolution reads the dep module, which must not be nil).
++		mctx.module.cachedName = mctx.module.logicModule.Name()
++		mctx.module.cachedString = mctx.module.logicModule.String()
++		mctx.module.logicModule = nil
++		mctx.module.properties = nil
++		mctx.module.propertyPos = nil
++	}
++
++	module.cachedUniqueName = uniqueName
++
++	if newErrs := c.processLocalBuildActions(&module.actionDefs, &mctx.actionDefs, liveGlobals); len(newErrs) > 0 {
++		return nil, newErrs
++	}
++	return ninjaDeps, nil
++}
++
++// generateTargeted regenerates only the dirty modules plus the modules reached by
++// provider-interface propagation, via a worklist in dependency order -- O(edit +
++// affected) instead of the O(whole-tree) parallel visit that touches every clean
++// module. A module regenerates when it is dirty (re-mutated) or a dependency's
++// exposed interface changed this pass; after it generates, if its OWN interface
++// changed, its reverse-deps are pulled into the affected set. Propagation stops
++// where an interface is unchanged, so a local edit generates only itself.
++func (c *Context) generateTargeted(config interface{}, liveGlobals *liveTracker) ([]string, []error) {
++	var deps []string
++	var errs []error
++
++	inAffected := make(map[*moduleInfo]bool)
++	done := make(map[*moduleInfo]bool)
++	remaining := make(map[*moduleInfo]int) // # of affected, not-yet-done forward deps
++	var ready []*moduleInfo
++
++	countAffectedDeps := func(m *moduleInfo) int {
++		n := 0
++		for _, fd := range m.forwardDeps {
++			if inAffected[fd] && !done[fd] {
++				n++
++			}
++		}
++		return n
++	}
++	var add func(m *moduleInfo)
++	add = func(m *moduleInfo) {
++		if inAffected[m] {
++			return
++		}
++		inAffected[m] = true
++		// m is now an affected, not-done forward dep of each affected, not-done
++		// reverse dep, which must therefore wait for it.
++		for _, rd := range m.reverseDeps {
++			if inAffected[rd] && !done[rd] {
++				remaining[rd]++
++			}
++		}
++		remaining[m] = countAffectedDeps(m)
++		if remaining[m] == 0 {
++			ready = append(ready, m)
++		}
++	}
++
++	for m := range c.dirtyModules {
++		add(m)
++	}
++
++	for len(ready) > 0 {
++		m := ready[len(ready)-1]
++		ready = ready[:len(ready)-1]
++		if done[m] || remaining[m] > 0 {
++			// Stale ready entry: a dependency became affected after m was queued.
++			continue
++		}
++		// A propagated (not pre-reset) module must be reset before regenerating; a
++		// dirty (re-mutated) module was already reset by re-mutation.
++		if !c.dirtyModules[m] {
++			c.resetModuleBuildActions(m)
++		}
++		nd, es := c.generateOneModule(config, m, liveGlobals)
++		deps = append(deps, nd...)
++		if len(es) > 0 {
++			errs = append(errs, es...)
++			break
++		}
++		done[m] = true
++		// Unblock affected reverse-deps that were waiting on m.
++		for _, rd := range m.reverseDeps {
++			if inAffected[rd] && !done[rd] {
++				remaining[rd]--
++				if remaining[rd] == 0 {
++					ready = append(ready, rd)
++				}
++			}
++		}
++		// If m's interface changed, its (other) reverse-deps must regenerate too.
++		// m is already done, so add() won't miscount it.
++		if m.interfaceChanged {
++			for _, rd := range m.reverseDeps {
++				add(rd)
++			}
++		}
++	}
++
++	// Fold ONLY the regenerated modules' new interfaces back into the resident
++	// baseline (O(affected), not the O(tree) commitInterfaceHashes over all
++	// variants). Clean modules' interfaces are unchanged from the last build.
++	if c.incMutation != nil && c.incMutation.interfaceHash != nil {
++		for m := range done {
++			if m.interfaceChanged {
++				if h, ok := interfaceHashOf(m); ok {
++					c.incMutation.interfaceHash[moduleIdentity(m.cachedUniqueName, m.variant.name)] = h
++				}
++			}
++		}
++	}
++	// Publish the regenerated set (dirty + propagation-affected) so the incremental
++	// provider-hash fold patches the aggregate for every module whose provider
++	// hashes could have changed, not just the originally dirty ones.
++	c.regeneratedModules = done
++	return deps, errs
++}
++
++// providerTerm folds a module's stable identity salt together with the hash of a
++// single provider value into one term. The global per-provider aggregate is the
++// commutative sum of these terms across all modules, which makes it incrementally
++// updatable: when a module's value changes we subtract its old term and add its
++// new one. Folding the salt in means two distinct modules whose values happen to
++// swap cannot net to zero (their terms are different functions), so the aggregate
++// still flips when content actually changes.
++func providerTerm(salt, valueHash uint64) uint64 {
++	h := fnv.New64a()
++	var b [16]byte
++	binary.LittleEndian.PutUint64(b[0:8], salt)
++	binary.LittleEndian.PutUint64(b[8:16], valueHash)
++	h.Write(b[:])
++	return h.Sum64()
++}
++
++// providerSalt hashes a module's stable identity into the salt folded into every
++// one of its provider terms, so distinct modules contribute distinct terms even
++// when their provider values coincide.
++func providerSalt(id string) uint64 {
++	h := fnv.New64a()
++	io.WriteString(h, id)
++	return h.Sum64()
++}
++
++func singletonSalt(name string) uint64 {
++	h := fnv.New64a()
++	io.WriteString(h, name)
++	return h.Sum64()
++}
++
++// providerFoldIdentity returns a stable, namespace-qualified identity for a module:
++// the same logical module+variant yields the same string across warm rebuilds, and
++// two modules with the same local name in different namespaces do not collide. It is
++// derived from nameInterface.UniqueName (not the cachedUniqueName field, which
++// resetModuleBuildActions clears), so it is valid even mid-warm-rebuild.
++func (c *Context) providerFoldIdentity(m *moduleInfo) string {
++	uniqueName := c.nameInterface.UniqueName(newNamespaceContext(m), m.group.name)
++	return moduleIdentity(uniqueName, m.variant.name)
++}
++
++// foldSingletonProviderSlots recomputes the aggregate entries for singleton-set
++// providers from scratch. There are few singletons, so this is cheap, and it keeps
++// those slots correct even though the per-module warm delta only touches
++// module-set providers.
++func (c *Context) foldSingletonProviderSlots(agg []uint64) {
++	var sgs []*singletonInfo
++	c.VisitAllSingletons(func(s SingletonProxy) {
++		sgs = append(sgs, s.singleton)
++	})
++	for i := 0; i < len(providerRegistry); i++ {
++		if providerRegistry[i].mutator != singletonTag {
++			continue
++		}
++		var sum uint64
++		for _, s := range sgs {
++			h := s.providerInitialValueHashes
++			if i < len(h) && h[i] != 0 {
++				sum += providerTerm(singletonSalt(s.name), h[i])
++			}
++		}
++		agg[i] = sum
++	}
++}
++
++// updateProvidersHashesIncremental patches the global provider-hash aggregate for a
++// warm rebuild by applying only the regenerated modules' deltas (O(edit)) against
++// the snapshots in foldedProviderHashes, instead of re-summing every module. It is
++// only safe when the module set is unchanged (membershipChanged == false); the
++// caller guarantees that, so every changed identity already has a snapshot here
++// (object replacement keeps the same identity). The regenerated set is the dirty
++// modules PLUS propagation-affected readers; falling back to dirtyModules supports
++// direct unit tests that do not run a targeted generate.
++func (c *Context) updateProvidersHashesIncremental() {
++	regenerated := c.regeneratedModules
++	if regenerated == nil {
++		regenerated = c.dirtyModules
++	}
++	for m := range regenerated {
++		id := c.providerFoldIdentity(m)
++		salt := providerSalt(id)
++		cur := m.providerInitialValueHashes
++		old := c.foldedProviderHashes[id]
++		limit := len(cur)
++		if len(old) > limit {
++			limit = len(old)
++		}
++		for i := 0; i < limit; i++ {
++			var ov, nv uint64
++			if i < len(old) {
++				ov = old[i]
++			}
++			if i < len(cur) {
++				nv = cur[i]
++			}
++			if ov == nv || providerRegistry[i].mutator == singletonTag {
++				continue
++			}
++			if ov != 0 {
++				c.providerValueHashes[i] -= providerTerm(salt, ov)
++			}
++			if nv != 0 {
++				c.providerValueHashes[i] += providerTerm(salt, nv)
++			}
++		}
++		c.foldedProviderHashes[id] = slices.Clone(cur)
++	}
++	// Singleton-set provider slots are not covered by the per-module delta; refold
++	// them (cheap) so a singleton consuming another singleton's provider stays sound.
++	c.foldSingletonProviderSlots(c.providerValueHashes)
++}
++
++// SingletonsNinjaFile returns the path of the subninja holding the singleton build
++// actions, derived from the top-level ninja file name. Exposed so soong_ui can
++// list/clean it alongside the module shards (GetNinjaShardFiles).
++func SingletonsNinjaFile(ninjaFile string) string {
++	return strings.TrimSuffix(ninjaFile, ".ninja") + ".singletons.ninja"
++}
++
++// writeSingletonsSubninja writes the singleton build actions to their own subninja
++// file and references it from the top-level manifest. On a targeted resident
++// rebuild the singletons are kept (singletonsNeedRegen is false), so the on-disk
++// file is already current and is left untouched -- avoiding the dominant cost of
++// rewriting the large singleton section.
++func (c *Context) writeSingletonsSubninja(nw *ninjaWriter, ninjaFileName string) error {
++	file := SingletonsNinjaFile(ninjaFileName)
++	if err := nw.Subninja(file); err != nil {
++		return err
++	}
++	if c.dirtyModules != nil && !c.singletonsNeedRegen() {
++		// Resident rebuild keeping singletons: the existing file is byte-exact.
++		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja\n")
++		return nil
++	}
++	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
++	if err != nil {
++		return fmt.Errorf("error opening singletons Ninja file: %s", err)
++	}
++	defer f.Close()
++	buf := bufio.NewWriterSize(f, 16*1024*1024)
++	sw := newNinjaWriter(buf)
++	if err := c.writeAllSingletonActions(sw); err != nil {
++		return err
++	}
++	return buf.Flush()
++}
++
++// PhonysNinjaFile returns the path of the subninja holding the deduplicated
++// order-only-dep phony build statements, derived from the top-level ninja file
++// name. Exposed so soong_ui can list/clean it alongside the module shards.
++func PhonysNinjaFile(ninjaFile string) string {
++	return strings.TrimSuffix(ninjaFile, ".ninja") + ".phonys.ninja"
++}
++
++// writePhonysSubninja writes the deduplicated order-only-dep phony build
++// statements to their own subninja and references it from the top-level manifest.
++// This section is large (~60% of the top-level manifest on a full Android tree)
++// but is a pure function of every module's order-only deps, so on a resident
++// rebuild it usually does not change. The content is serialized once into memory
++// and hashed; if the hash matches the previous build (and this is a targeted
++// rebuild) the existing on-disk file is byte-exact and is left untouched,
++// avoiding the dominant cost of rewriting it. Otherwise it is written and the
++// hash recorded.
++func (c *Context) writePhonysSubninja(nw *ninjaWriter, ninjaFileName string, phonys *localBuildActions) error {
++	file := PhonysNinjaFile(ninjaFileName)
++	if err := nw.Subninja(file); err != nil {
++		return err
++	}
++
++	var bb bytes.Buffer
++	if err := c.writeLocalBuildActions(newNinjaWriter(&bb), phonys); err != nil {
++		return err
++	}
++	hasher := fnv.New64a()
++	hasher.Write(bb.Bytes())
++	sum := hasher.Sum64()
++	if c.dirtyModules != nil && sum == c.phonysHash {
++		// Resident rebuild and the phony set is unchanged: the existing file is
++		// byte-exact, leave it.
++		fmt.Fprintf(os.Stderr, "soong_build delta write: kept phonys subninja\n")
++		return nil
++	}
++	c.phonysHash = sum
++
++	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
++	if err != nil {
++		return fmt.Errorf("error opening phonys Ninja file: %s", err)
++	}
++	defer f.Close()
++	out := bufio.NewWriterSize(f, 16*1024*1024)
++	if _, err := out.Write(bb.Bytes()); err != nil {
++		return err
++	}
++	return out.Flush()
++}
++
++// ninjaShardCount is the number of subninja shards the module build statements are
++// split across. More shards make the resident delta write/reparse finer-grained:
++// an edit touching one module rewrites (and a resident executor reparses) only the
++// shard holding it, so smaller shards approach O(edit). The count must be the same
++// for the cold build that wrote the shards and any warm build that selectively
++// rewrites them, so it is taken from the environment once and applied everywhere
++// via GetNinjaShardFiles. Defaults to 10 (historical value).
++func ninjaShardCount() int {
++	if v := os.Getenv("SOONG_NINJA_SHARDS"); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n > 0 {
++			return n
++		}
++	}
++	return 10
++}
++
++// wasRegenerated reports whether a module's build actions were regenerated in
++// this targeted rebuild. This is the FULL regenerated set -- the originally dirty
++// modules PLUS the propagation-affected readers that generateTargeted re-ran
++// because a dependency's exported interface changed (c.regeneratedModules). The
++// delta write must key off this, not c.dirtyModules: a propagated module (e.g. a
++// library that inlines a reordered filegroup's srcs) has new build actions in
++// memory but is not in dirtyModules, so keying off dirtyModules would skip its
++// shard and reuse its stale cached ninja text. Falls back to dirtyModules before
++// generateTargeted has published the regenerated set.
++func (c *Context) wasRegenerated(m *moduleInfo) bool {
++	if c.posShiftedModules[m] {
++		return true // content unchanged, but its "# Defined:" line moved -> re-serialize
++	}
++	if c.orderOnlyDirtyModules[m] {
++		return true // a shared order-only key crossed the dedup threshold -> text changed
++	}
++	if c.regeneratedModules != nil {
++		return c.regeneratedModules[m]
++	}
++	return c.dirtyModules[m]
++}
++
++// shardHasDirtyModule reports whether any module in a ninja shard was regenerated
++// in this targeted rebuild, meaning the shard's on-disk file is stale and must be
++// rewritten.
++func (c *Context) shardHasDirtyModule(batch []*moduleInfo) bool {
++	for _, m := range batch {
++		if c.wasRegenerated(m) {
++			return true
++		}
++	}
++	return false
++}
++
++// shardModulesStable partitions modules into n shards by a stable hash of each
++// module's identity (cachedUniqueName + variant), not by sorted position. Unlike
++// proptools.ShardByCount -- which splits the sorted list into n contiguous chunks,
++// so inserting one module shifts every later module across shard boundaries -- a
++// module's shard here depends only on its own identity. Adding or removing a module
++// therefore leaves every other module in exactly the same shard, which keeps the
++// delta write O(edit) across a membership change: only the shard(s) holding a
++// changed or added module are rewritten. The input must be pre-sorted; each shard
++// preserves that order, so the partition is deterministic and identical between warm
++// and cold builds.
++// stableShardIndex returns the shard a module's actions land in, as a stable hash
++// of its identity (cachedUniqueName + variant) modulo n. Independent of the rest of
++// the module set, so it survives add/remove.
++func stableShardIndex(cachedUniqueName, variantName string, n int) int {
++	if n <= 0 {
++		return 0
++	}
++	h := fnv.New64a()
++	h.Write([]byte(cachedUniqueName))
++	h.Write([]byte{0})
++	h.Write([]byte(variantName))
++	return int(h.Sum64() % uint64(n))
++}
++
++func shardModulesStable(modules []*moduleInfo, n int) [][]*moduleInfo {
++	shards := make([][]*moduleInfo, n)
++	if n <= 0 {
++		return shards
++	}
++	for _, m := range modules {
++		idx := stableShardIndex(m.cachedUniqueName, m.variant.name, n)
++		shards[idx] = append(shards[idx], m)
++	}
++	return shards
++}
++
++// deduplicateOrderOnlyDepsStock is upstream's order-only dedup, used unchanged for
++// every non-resident build. Kept verbatim so a normal build's manifest matches
++// upstream byte-for-byte.
++func (c *Context) deduplicateOrderOnlyDepsStock(modules []*moduleInfo) *localBuildActions {
++	var phonys []*buildDef
++	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
++	c.orderOnlyStrings.Range(func(key uniquelist.UniqueList[string], info *orderOnlyStringsInfo) bool {
++		if info.dedup {
++			dedup := fmt.Sprintf("dedup-%x", keyForPhonyCandidate(key.ToSlice()))
++			phony := &buildDef{
++				Rule:          Phony,
++				OutputStrings: []string{dedup},
++				InputStrings:  key.ToSlice(),
++			}
++			info.dedupName = dedup
++			phonys = append(phonys, phony)
++			if info.incremental {
++				c.orderOnlyStringsCache[phony.OutputStrings[0]] = phony.InputStrings
++			}
++		}
++		return true
++	})
++
++	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
++		func(m *moduleInfo, pause pauseFunc) bool {
++			for _, def := range m.actionDefs.buildDefs {
++				if info, loaded := c.orderOnlyStrings.Load(def.OrderOnlyStrings); loaded {
++					if info.dedup {
++						def.OrderOnlyStrings = uniquelist.Make([]string{info.dedupName})
++						m.orderOnlyStrings = append(m.orderOnlyStrings, info.dedupName)
++					}
++				}
++			}
++			return false
++		})
++
++	return &localBuildActions{buildDefs: phonys}
++}
++
++// deduplicateOrderOnlyDepsResident recomputes the order-only dedup decision
++// deterministically from the live graph every build: a key is deduped iff it is
++// used by >=2 build statements. The count is taken from each def's IMMUTABLE
++// OrderOnlyOriginal, so a warm targeted rebuild produces the identical decision to
++// a cold build (no persisted registration-order state), and the rewrite below is
++// non-destructive (always derived from the original, so a decision change is
++// reversible). This is the "generate is a pure, content-addressed function of the
++// resolved graph" invariant applied to order-only dedup.
++func (c *Context) deduplicateOrderOnlyDepsResident(modules []*moduleInfo) *localBuildActions {
++	type keyInfo struct {
++		count       int
++		incremental bool
++	}
++	counts := map[uniquelist.UniqueList[string]]*keyInfo{}
++	bump := func(key uniquelist.UniqueList[string], incremental bool) {
++		ki := counts[key]
++		if ki == nil {
++			ki = &keyInfo{}
++			counts[key] = ki
++		}
++		ki.count++
++		ki.incremental = ki.incremental || incremental
++	}
++	prevCache := c.orderOnlyStringsCache
++	for _, m := range modules {
++		if len(m.actionDefs.buildDefs) == 0 {
++			// Restored module (on-disk incremental): it kept its emitted order-only
++			// (dedup names) but has no live defs; count its cached originals so a
++			// shared key stays deduped.
++			for _, name := range m.orderOnlyStrings {
++				if orig, ok := prevCache[name]; ok {
++					bump(uniquelist.Make(orig), true)
++				}
++			}
++			continue
++		}
++		for _, def := range m.actionDefs.buildDefs {
++			if def.OrderOnlyOriginal.Len() == 0 {
++				continue
++			}
++			bump(def.OrderOnlyOriginal, m.buildActionCacheKey != nil)
++		}
++	}
++
++	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
++	dedupName := map[uniquelist.UniqueList[string]]string{}
++	var phonys []*buildDef
++	for key, ki := range counts {
++		if ki.count < 2 {
++			continue
++		}
++		name := fmt.Sprintf("dedup-%x", keyForPhonyCandidate(key.ToSlice()))
++		dedupName[key] = name
++		phonys = append(phonys, &buildDef{
++			Rule:          Phony,
++			OutputStrings: []string{name},
++			InputStrings:  key.ToSlice(),
++		})
++		if ki.incremental {
++			c.orderOnlyStringsCache[name] = key.ToSlice()
++		}
++	}
++
++	var orderOnlyChangedMu sync.Mutex
++	var orderOnlyChanged []*moduleInfo
++	parallelVisit(slices.Values(modules), unorderedVisitorImpl{}, parallelVisitLimit,
++		func(m *moduleInfo, pause pauseFunc) bool {
++			if len(m.actionDefs.buildDefs) == 0 {
++				return false // restored module: keep its emitted order-only as-is
++			}
++			m.orderOnlyStrings = m.orderOnlyStrings[:0]
++			changed := false
++			for _, def := range m.actionDefs.buildDefs {
++				if def.OrderOnlyOriginal.Len() == 0 {
++					continue
++				}
++				prev := def.OrderOnlyStrings // last build's emitted value (clean modules keep it)
++				if name, ok := dedupName[def.OrderOnlyOriginal]; ok {
++					def.OrderOnlyStrings = uniquelist.Make([]string{name})
++					m.orderOnlyStrings = append(m.orderOnlyStrings, name)
++				} else {
++					def.OrderOnlyStrings = def.OrderOnlyOriginal
++				}
++				if prev != def.OrderOnlyStrings { // UniqueList is comparable
++					changed = true
++				}
++			}
++			// A clean module whose emitted order-only flipped (a shared key crossed the
++			// dedup threshold because a dirty module added/dropped a use of it) has stale
++			// on-disk ninja text. Record it so wasRegenerated() forces its shard to be
++			// rewritten and its cached bytes dropped. Already-dirty modules are a no-op.
++			if changed && !c.wasRegenerated(m) {
++				orderOnlyChangedMu.Lock()
++				orderOnlyChanged = append(orderOnlyChanged, m)
++				orderOnlyChangedMu.Unlock()
++			}
++			return false
++		})
++
++	if len(orderOnlyChanged) > 0 {
++		if c.orderOnlyDirtyModules == nil {
++			c.orderOnlyDirtyModules = make(map[*moduleInfo]bool, len(orderOnlyChanged))
++		}
++		for _, m := range orderOnlyChanged {
++			c.orderOnlyDirtyModules[m] = true
++		}
++	}
++
++	return &localBuildActions{buildDefs: phonys}
++}
 diff --git a/metrics/event_handler.go b/metrics/event_handler.go
 index 35a6858..24dde07 100644
 --- a/metrics/event_handler.go
@@ -6961,14 +5532,18 @@ index fc87744..f234ab0 100644
  	if name == "" {
  		return
 diff --git a/ninja_defs.go b/ninja_defs.go
-index ef0c4b4..93e60d6 100644
+index ef0c4b4..4b8411e 100644
 --- a/ninja_defs.go
 +++ b/ninja_defs.go
-@@ -265,7 +265,13 @@ type buildDef struct {
+@@ -265,11 +265,17 @@ type buildDef struct {
  	ImplicitStrings       []string
  	OrderOnly             []*ninjaString
  	OrderOnlyStrings      uniquelist.UniqueList[string]
 -	Validations           []*ninjaString
+-	ValidationStrings     []string
+-	Args                  map[Variable]*ninjaString
+-	Variables             map[string]*ninjaString
+-	Default               bool
 +	// OrderOnlyOriginal is the order-only string list as originally parsed, kept
 +	// immutable. deduplicateOrderOnlyDeps writes OrderOnlyStrings (the emitted
 +	// form: a dedup-<hash> phony when shared, else the original) on every build by
@@ -6976,9 +5551,13 @@ index ef0c4b4..93e60d6 100644
 +	// a warm targeted rebuild produces the identical decision to a cold build.
 +	OrderOnlyOriginal uniquelist.UniqueList[string]
 +	Validations       []*ninjaString
- 	ValidationStrings     []string
- 	Args                  map[Variable]*ninjaString
- 	Variables             map[string]*ninjaString
++	ValidationStrings []string
++	Args              map[Variable]*ninjaString
++	Variables         map[string]*ninjaString
++	Default           bool
+ }
+ 
+ func formatTags(tags map[string]string, rule Rule) string {
 @@ -343,6 +349,7 @@ func parseBuildParams(scope scope, params *BuildParams,
  	}
  

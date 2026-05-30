@@ -1,77 +1,108 @@
 # Warm-incremental Soong — patch summary
 
 Goal: edit an `Android.bp`, regenerate `build.ninja` in O(edit) instead of
-re-analyzing the whole tree. All numbers below are **measured on real AOSP**
-(`aosp_cf_x86_64_phone-trunk_staging-userdebug`), and every warm result was
-verified **byte-identical** to a cold rebuild of the same edited tree (`cmp`,
-403/403 manifest shards).
+re-analyzing the whole tree, **byte-identical to a clean build**. All numbers below
+are measured on real AOSP (`aosp_cf_x86_64_phone-trunk_staging-userdebug`,
+soong-only, `m nothing`), edit on **`frameworks/base/Android.bp`** (the realistic
+worst case). Every warm result was verified `cmp`-identical to a cold resident
+rebuild of the same edited tree (every ninja + `.mk` shard).
 
-## Measured (real frameworks/base edit: services.core.unboosted)
+## Enabling
 
-| phase                         | cold    | warm (this patch) |
-|-------------------------------|--------:|------------------:|
-| reparse                       |   ~5 s  | **0.40 s**        |
-| mutate + generate + write     | ~126 s  | **4.0 s**         |
-| **soong analysis (ninja gen)**| **131 s** | **4.4 s  (~30x)** |
-| total `m nothing` wall        | 136 s   | 17.8 s            |
-| byte-identical to cold        |   —     | **yes**           |
+One environment variable on an otherwise-normal build:
 
-Ninja *generation* (producing the updated build.ninja) is single-digit seconds.
-The remaining wall (17.8 s) is NOT soong analysis anymore — it is dumpvars
-(~2.5 s) and `ninja` reloading the 5.6 GB manifest cold (~5.1 s), which are
-separate processes (see "Not done yet").
+```sh
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing   # first build cold (starts daemon)
+#   …edit an Android.bp…
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing   # warm: O(edit), byte-identical
+```
+
+## The gating invariant (why this is mergeable and safe)
+
+Every warm-specific manifest divergence (content-addressed shard assignment,
+sharded incremental subninja, separate phonys subninja, order-only-dedup recompute)
+is gated behind `residentNinjaLayout()` (the resident-mode flag). Therefore:
+
+- **A non-resident / cold build is byte-identical to upstream Soong.** The upstream
+  Blueprint unit tests pass unchanged. Applying the patch does not change a normal
+  build (including a Kati-enabled Pixel `m`).
+- **A warm resident rebuild is byte-identical to a cold resident rebuild** of the
+  same edited tree. That is the guarantee that the incremental analysis is exact.
+- The resident manifest layout differs from stock by design (content-addressed
+  sharding is what makes the O(edit) delta write possible), so the byte-gate's
+  ground truth is a *resident* cold build.
+
+## Measured (frameworks/base/Android.bp, soong-only)
+
+| edit | reparse | singletons | delta write | byte-identical |
+|---|--:|---|---|:--:|
+| property edit | 0.40 s | kept | 13 modules regenerated; 34/50 ninja + 50/50 incr shards skipped | yes |
+| add a module | 0.49 s | re-run | 47/50 ninja + 50/50 incr shards skipped; phonys kept | yes |
+| remove a module | 0.47 s | re-run | 47/50 ninja + 49/50 incr skipped; removed module's shard force-rewritten | yes |
+
+Reparse is one changed file (~0.4 s) versus a full-tree reparse (~4–5 s at AOSP
+scale). The manifest write is O(edit): only shards containing a changed module are
+rewritten. On an **add/remove** the warm cost is dominated by **singleton
+regeneration** (a membership change re-runs whole-graph aggregations like the
+module-info and phony singletons); a **property edit keeps singletons** and is
+cheaper.
+
+Two subtle correctness mechanisms keep warm == cold for these too: (1) order-only
+dedup is recomputed from immutable inputs every build, and a clean module whose
+emitted order-only flips because a shared key crossed the dedup threshold is forced
+to re-serialize (no stale shard); (2) singleton phony contributions are recomputed
+fresh, and the pure-add phony fold is taken only when they are unchanged, else the
+phony makefile is rebuilt fully.
 
 ## How it works
 
-A resident `soong_build` server (`SOONG_PERSISTENT_REUSE_GRAPH=true`) keeps the
-resolved+mutated Blueprint graph and caches in RAM across builds. On a warm edit:
-1. reparse ONLY the changed .bp files (not all 14k),
-2. diff vs the resident baseline → dirty module set,
+A resident `soong_build` server keeps the resolved+mutated Blueprint graph and
+caches in RAM across builds. On a warm edit:
+1. reparse ONLY the changed `.bp` files (not all 14k),
+2. diff vs the resident baseline → changed / added / removed module sets,
 3. re-mutate only the affected closure (skip the ~34 s whole-tree mutator pass),
 4. regenerate only dirty modules + provider-interface-changed dependents,
-5. delta-write: rewrite only the ninja shards containing a changed module.
+5. delta-write: rewrite only the shards containing a changed module.
 
-Requires the daemon — a batch/no-daemon design cannot skip parse+mutate because
-it has nothing in memory to skip to.
+Anything the incremental path can't represent (an unsupported mutator, a structural
+change it can't prove neutral, a changed product config) returns
+`ErrFallbackToFullBuild` and does a full cold rebuild, logged `WARM-FALLBACK:
+<reason>` — so the output is always correct. Requires the daemon: a batch/no-daemon
+design cannot skip parse+mutate because it has nothing in memory to skip to.
 
 ## Patch contents
 
-build/soong (10 files, +1560/-13), base f389fa2a2:
+build/soong (base f389fa2a2):
   cmd/soong_build/persistent.go   resident server (client/server over unix sock)
-  cmd/soong_build/main.go         runBuildReuse warm path + changed-file reparse
+  cmd/soong_build/main.go         runBuildReuse warm path + changed-file reparse + WARM-FALLBACK
   ui/build/{soong,ninja,ninja_resident,config}.go  soong_ui wiring
-  android/singleton_module.go     graph-residency state reset
+  android/{phony,singleton,singleton_module,namespace}.go  singleton/phony incremental support
   docs/*                          design + tutorial
 
-build/blueprint (23 files, +6262/-144), base c39c8a4:
+build/blueprint (base c39c8a4):
   incremental_mutation.go         the engine: baselines, DiffParsedModules,
                                   ChangedBlueprintFiles, re-mutation strategies
-  context.go                      delta + SHARDED ninja write, generate worklist
-  incremental.go, metrics, etc.   supporting
-  incr/ (~8 files)                SEPARATE experimental native-emitter prototype
-                                  (bpgen-in-blueprint); tangential to warm soong.
-
-## My fixes this session (~125 lines) that made the prior scaffolding actually work
-
-The prior resident-server work was committed but had never run a real edit
-end-to-end on AOSP. Testing it on real AOSP (not its synthetic tests) exposed:
-- **nil-map crash**: BeginIncrementalBuild (which inits posShiftedModules) ran
-  AFTER DiffParsedModules wrote it -> panic on the first line-shifting edit.
-  Fixed by reordering. (main.go)
-- **23 s write**: the 2.9 GB incremental-modules subninja was rewritten WHOLE on
-  any edit. Sharded it like the main modules -> write became O(edit), 23 s -> 4 s.
-  (context.go)
-- **4.4 s reparse**: still parsed all 14k .bp to find the change. Added
-  ChangedBlueprintFiles (hash on-disk vs snapshot) + parse only changed -> 0.4 s.
-  (incremental_mutation.go + main.go)
+  incremental_ninja.go            NEW FILE: the resident-mode *Context additions
+                                  (graph residency, content-addressed shard layout,
+                                  O(edit) delta write) — kept out of context.go so the
+                                  feature is additive and merges cleanly
+  context.go                      thin call-sites into incremental_ninja.go + the
+                                  residentNinjaLayout() gate (stock path unchanged)
+  incremental_mutation_test.go    byte-identical edit corpus
+  ninja_defs.go, provider.go, singleton_ctx.go, name_interface.go, …  supporting
 
 ## Not done yet / honest caveats
 
-- "Single-digit" is ninja GENERATION (4.4 s). The full `m` wall (17.8 s) needs:
-  resident ninja (n2) to avoid the 5.6 GB manifest reload (~5.1 s), and dumpvars
-  caching (~2.5 s). The ui/build/ninja_resident.go in this patch is unverified.
-- ADD/REMOVE a module falls back to a full ~136 s rebuild (whole-tree singleton
-  aggregations are not incremental yet).
-- Byte-identity verified for property edits to existing modules (a leaf cc_binary
-  and frameworks/base services.core.unboosted). Not a full edit-class corpus.
-- This is LOCAL, experimental work; NOT in upstream AOSP and NOT pushed anywhere.
+- "Single-digit" is for a property edit's ninja generation; an **add/remove** is
+  dominated by singleton regeneration (~24 s) because a membership change re-runs
+  whole-graph singletons. Folding those incrementally is future work.
+- The full `m` wall still carries product-config (`dumpvars`, ~2.5 s) and a
+  stock-`ninja` manifest reload, which are separate processes. A resident ninja
+  (n2) and a dumpvars cache would remove them; the `ui/build/ninja_resident.go`
+  here is unverified.
+- Byte-identity verified for property edit / add / remove on
+  `frameworks/base/Android.bp`, soong-only, on `aosp_cf_x86_64_phone`. **Not** an
+  exhaustive edit-class corpus, and **not** yet verified on Kati / vendor / Pixel
+  (with the env off, those builds are unaffected; with it on, unsupported cases
+  fall back to a correct full rebuild — see the gating invariant).
+- LOCAL, experimental work; NOT in upstream AOSP and NOT pushed anywhere.

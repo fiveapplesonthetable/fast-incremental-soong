@@ -1,4 +1,4 @@
-From 45656a900a24eeffc15ff813b72b21653ea1b9a4 Mon Sep 17 00:00:00 2001
+From da7a5215320c429649252704079bb06e907109b5 Mon Sep 17 00:00:00 2001
 From: Zimuzo Ezeozue <zezeozue@google.com>
 Date: Sat, 30 May 2026 14:40:16 +0000
 Subject: [PATCH] =?UTF-8?q?soong:=20resident=20warm-incremental=20build=20?=
@@ -27,19 +27,19 @@ IncrementalAddModules/Remove with fallback. Local/experimental.
 Change-Id: Id5fffb376513e3028b76af007f85b687bd351126
 ---
  android/namespace.go               |  13 +
- android/phony.go                   | 186 ++++++++------
+ android/phony.go                   | 219 +++++++++++------
  android/singleton.go               |  10 +
  android/singleton_module.go        |  11 +
  cmd/soong_build/Android.bp         |   1 +
- cmd/soong_build/main.go            | 348 +++++++++++++++++++++++++-
- cmd/soong_build/persistent.go      | 329 +++++++++++++++++++++++++
+ cmd/soong_build/main.go            | 250 ++++++++++++++++++-
+ cmd/soong_build/persistent.go      | 331 +++++++++++++++++++++++++
  docs/incremental_soong_tutorial.md | 343 ++++++++++++++++++++++++++
  docs/resident_incremental_build.md | 380 +++++++++++++++++++++++++++++
  ui/build/config.go                 |   5 +
  ui/build/ninja.go                  |  10 +
  ui/build/ninja_resident.go         | 120 +++++++++
  ui/build/soong.go                  |  41 ++++
- 13 files changed, 1710 insertions(+), 87 deletions(-)
+ 13 files changed, 1651 insertions(+), 83 deletions(-)
  create mode 100644 cmd/soong_build/persistent.go
  create mode 100644 docs/incremental_soong_tutorial.md
  create mode 100644 docs/resident_incremental_build.md
@@ -70,7 +70,7 @@ index 7d2ace2ca..17dcf9252 100644
  	r.rootNamespace.moduleContainer.NewSkippedModule(ctx, name, skipInfo)
  }
 diff --git a/android/phony.go b/android/phony.go
-index 105477a05..76af9a615 100644
+index 105477a05..8aab5829d 100644
 --- a/android/phony.go
 +++ b/android/phony.go
 @@ -16,6 +16,7 @@ package android
@@ -81,10 +81,25 @@ index 105477a05..76af9a615 100644
  	"runtime"
  	"sort"
  	"strings"
-@@ -46,102 +47,139 @@ type phonySingleton struct {
+@@ -42,106 +43,184 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
+ type phonySingleton struct {
+ 	phonyMap  phonyMap
+ 	phonyList []string
++	// singletonPhonyMap is the previous build's phony contributions from OTHER
++	// singletons (SingletonPhonyProvider), kept so the resident pure-add fold can tell
++	// whether they changed. Singletons aggregate over the whole module set, so adding a
++	// module can change them; if they changed the fold is unsafe and we rebuild fully.
++	singletonPhonyMap phonyMap
+ }
  
  var _ SingletonMakeVarsProvider = (*phonySingleton)(nil)
  
+-func (p *phonySingleton) GenerateBuildActions(ctx SingletonContext) {
+-	p.phonyMap = make(phonyMap)
+-	ctx.VisitAllModuleProxies(func(m ModuleProxy) {
+-		if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
+-			for k, v := range info.Phonies {
+-				p.phonyMap[k] = append(p.phonyMap[k], v...)
 +// phonyMkShards is the number of files the soong-only phony makefile is sharded
 +// into (soong_phony_targets.N.mk). A stable hash of each phony key picks its shard,
 +// so a warm add rewrites only the shards whose keys changed instead of the whole
@@ -97,35 +112,70 @@ index 105477a05..76af9a615 100644
 +	return int(h.Sum64() % phonyMkShards)
 +}
 +
- func (p *phonySingleton) GenerateBuildActions(ctx SingletonContext) {
--	p.phonyMap = make(phonyMap)
--	ctx.VisitAllModuleProxies(func(m ModuleProxy) {
--		if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
--			for k, v := range info.Phonies {
--				p.phonyMap[k] = append(p.phonyMap[k], v...)
++// samePhonyMap reports whether two phony maps are equal. The singleton visit order
++// is deterministic, so each key's Paths are produced in the same order build to build;
++// an order-sensitive compare (by Path.String) is therefore sufficient and exact.
++func samePhonyMap(a, b phonyMap) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, av := range a {
++		bv, ok := b[k]
++		if !ok || len(av) != len(bv) {
++			return false
++		}
++		for i := range av {
++			if av[i].String() != bv[i].String() {
++				return false
+ 			}
+ 		}
+-	})
++	}
++	return true
++}
+ 
++func (p *phonySingleton) GenerateBuildActions(ctx SingletonContext) {
 +	// touchedShards is the set of output .mk shards whose content changed this build.
 +	// On a pure add only the shards holding a newly-added module's phony keys change,
 +	// so only those are rebuilt and rewritten; the rest are kept on disk. On a full
 +	// build every shard is (re)written.
 +	touchedShards := map[int]bool{}
 +
-+	if ctx.IncrementalPureAdd() && p.phonyMap != nil {
-+		// Fold: keep the cached, already-sorted phonyMap from the previous build and
-+		// merge in only the modules added this build, re-sorting only the keys they
-+		// touch. Avoids re-reading all ~14k modules' providers and re-sorting all keys.
++	// Singletons are few, so always recompute their phony contributions fresh. This is
++	// what makes the pure-add fold below correct across a membership change: a singleton
++	// that aggregates over all modules (all_teams, sbom, owners, test_mapping, ...) can
++	// emit different phonies when a module is added, and the fold keeps the cached
++	// phonyMap, so it must not also silently reuse stale singleton phonies. If the
++	// singleton phonies changed since the last build, the fold is unsafe -> rebuild fully.
++	singletonPhonies := make(phonyMap)
+ 	ctx.VisitAllSingletons(func(s blueprint.SingletonProxy) {
+ 		if info, ok := OtherSingletonProvider(ctx, s, SingletonPhonyProvider); ok {
+ 			for k, v := range info.Phonies {
+-				p.phonyMap[k] = append(p.phonyMap[k], v...)
++				singletonPhonies[k] = append(singletonPhonies[k], v...)
+ 			}
+ 		}
+ 	})
++	singletonChanged := !samePhonyMap(singletonPhonies, p.singletonPhonyMap)
++	p.singletonPhonyMap = singletonPhonies
++
++	if ctx.IncrementalPureAdd() && p.phonyMap != nil && !singletonChanged {
++		// Fold: keep the cached, already-sorted phonyMap from the previous build (whose
++		// singleton phonies we just confirmed unchanged) and merge in only the modules
++		// added this build, re-sorting only the keys they touch. Avoids re-reading all
++		// ~14k modules' providers and re-sorting all keys.
 +		ctx.VisitAddedModuleProxies(func(m ModuleProxy) {
 +			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
 +				for k, v := range info.Phonies {
 +					p.phonyMap[k] = SortedUniquePaths(append(p.phonyMap[k], v...))
 +					touchedShards[phonyMkShardOf(k)] = true
 +				}
- 			}
++			}
 +		})
 +		p.phonyList = make([]string, 0, len(p.phonyMap))
 +		for phony := range p.phonyMap {
 +			p.phonyList = append(p.phonyList, phony)
- 		}
--	})
++		}
 +		sort.Strings(p.phonyList)
 +	} else {
 +		p.phonyMap = make(phonyMap)
@@ -137,25 +187,20 @@ index 105477a05..76af9a615 100644
 +			}
 +		})
  
--	ctx.VisitAllSingletons(func(s blueprint.SingletonProxy) {
--		if info, ok := OtherSingletonProvider(ctx, s, SingletonPhonyProvider); ok {
--			for k, v := range info.Phonies {
--				p.phonyMap[k] = append(p.phonyMap[k], v...)
-+		ctx.VisitAllSingletons(func(s blueprint.SingletonProxy) {
-+			if info, ok := OtherSingletonProvider(ctx, s, SingletonPhonyProvider); ok {
-+				for k, v := range info.Phonies {
-+					p.phonyMap[k] = append(p.phonyMap[k], v...)
-+				}
- 			}
--		}
--	})
-+		})
- 
 -	// We will sort phonyList in parallel with other stuff later, but for now copy it into
 -	// a slice in series so that we don't read and write to phonyMap concurrently.
 -	p.phonyList = make([]string, 0, len(p.phonyMap))
 -	for phony := range p.phonyMap {
 -		p.phonyList = append(p.phonyList, phony)
+-	}
++		// Merge the freshly-computed singleton phonies (computed above).
++		for k, v := range singletonPhonies {
++			p.phonyMap[k] = append(p.phonyMap[k], v...)
++		}
+ 
+-	type phonyDef struct {
+-		name string
+-		deps Paths
 -	}
 +		// We will sort phonyList in parallel with other stuff later, but for now copy it
 +		// into a slice in series so that we don't read and write to phonyMap concurrently.
@@ -164,18 +209,14 @@ index 105477a05..76af9a615 100644
 +			p.phonyList = append(p.phonyList, phony)
 +		}
  
--	type phonyDef struct {
--		name string
--		deps Paths
--	}
+-	sortChan := make(chan phonyDef, len(p.phonyMap))
+-	resultsChan := make(chan phonyDef)
+-	var wg sync.WaitGroup
 +		type phonyDef struct {
 +			name string
 +			deps Paths
 +		}
- 
--	sortChan := make(chan phonyDef, len(p.phonyMap))
--	resultsChan := make(chan phonyDef)
--	var wg sync.WaitGroup
++
 +		sortChan := make(chan phonyDef, len(p.phonyMap))
 +		resultsChan := make(chan phonyDef)
 +		var wg sync.WaitGroup
@@ -221,17 +262,17 @@ index 105477a05..76af9a615 100644
 -			deps: deps,
 +		for phony, deps := range p.phonyMap {
 +			sortChan <- phonyDef{name: phony, deps: deps}
++		}
++		close(sortChan)
++
++		for result := range resultsChan {
++			p.phonyMap[result.name] = result.deps
  		}
 -	}
 -	close(sortChan)
-+		close(sortChan)
  
 -	for result := range resultsChan {
 -		p.phonyMap[result.name] = result.deps
-+		for result := range resultsChan {
-+			p.phonyMap[result.name] = result.deps
-+		}
-+
 +		for i := 0; i < phonyMkShards; i++ {
 +			touchedShards[i] = true
 +		}
@@ -358,21 +399,10 @@ index 9265637ab..680d132fd 100644
      ],
      primaryBuilder: true,
 diff --git a/cmd/soong_build/main.go b/cmd/soong_build/main.go
-index 254dd25cc..53123f3a0 100644
+index 254dd25cc..f980b3aba 100644
 --- a/cmd/soong_build/main.go
 +++ b/cmd/soong_build/main.go
-@@ -20,8 +20,10 @@ import (
- 	"flag"
- 	"fmt"
- 	"os"
-+	"os/exec"
- 	"path/filepath"
- 	"runtime"
-+	"strconv"
- 	"strings"
- 	"time"
- 
-@@ -47,6 +49,12 @@ var (
+@@ -47,6 +47,12 @@ var (
  	delveListen string
  	delvePath   string
  
@@ -385,7 +415,7 @@ index 254dd25cc..53123f3a0 100644
  	cmdlineArgs android.CmdArgs
  )
  
-@@ -59,6 +67,24 @@ type ConfigCache struct {
+@@ -59,6 +65,24 @@ type ConfigCache struct {
  }
  
  func init() {
@@ -410,7 +440,7 @@ index 254dd25cc..53123f3a0 100644
  	// Flags that make sense in every mode
  	flag.StringVar(&topDir, "top", "", "Top directory of the Android source tree")
  	flag.StringVar(&cmdlineArgs.SoongOutDir, "soong_out", "", "Soong output directory (usually $TOP/out/soong)")
-@@ -90,12 +116,6 @@ func init() {
+@@ -90,12 +114,6 @@ func init() {
  	flag.BoolVar(&cmdlineArgs.RunGoTests, "t", false, "build and run go tests during bootstrap")
  	flag.BoolVar(&cmdlineArgs.IncrementalBuildActions, "incremental-build-actions", false, "generate build actions incrementally")
  	flag.StringVar(&cmdlineArgs.IncrementalDebugFile, "incremental-debug-file", "", "incremental debug file")
@@ -423,7 +453,7 @@ index 254dd25cc..53123f3a0 100644
  }
  
  func newNameResolver(config android.Config) *android.NameResolver {
-@@ -317,11 +337,41 @@ func main() {
+@@ -317,11 +335,41 @@ func main() {
  		// Disable collection of memory profiles if we won't save one to disk.
  		runtime.MemProfileRate = 0
  	}
@@ -466,7 +496,7 @@ index 254dd25cc..53123f3a0 100644
  	availableEnv := parseAvailableEnv()
  	configuration, err := android.NewConfig(cmdlineArgs, availableEnv)
  	maybeQuit(err, "")
-@@ -336,19 +386,39 @@ func main() {
+@@ -336,15 +384,34 @@ func main() {
  	ctx := newContext(configuration)
  	android.StartBackgroundMetrics(configuration)
  
@@ -506,12 +536,7 @@ index 254dd25cc..53123f3a0 100644
  	ctx.SetIncrementalDebugFile(cmdlineArgs.IncrementalDebugFile)
  
  	ctx.Register()
- 	finalOutputFile, ninjaDeps := runSoongOnlyBuild(ctx)
-+	runBpgenTakeoverAfterSoong(configuration)
- 
- 	ninjaDeps = append(ninjaDeps, configuration.ProductVariablesFileName)
- 	ninjaDeps = append(ninjaDeps, usedEnvFile)
-@@ -360,7 +430,10 @@ func main() {
+@@ -360,7 +427,10 @@ func main() {
  
  	writeDepFile(finalOutputFile, ctx.EventHandler, ninjaDeps)
  
@@ -523,7 +548,7 @@ index 254dd25cc..53123f3a0 100644
  		data, err := shared.EnvFileContents(configuration.EnvDeps())
  		maybeQuit(err, "")
  		configCache.EnvDepsHash, err = proptools.CalculateHash(data)
-@@ -380,6 +453,255 @@ func main() {
+@@ -380,6 +450,160 @@ func main() {
  	// are ninja inputs to the main output file, then ninja would superfluously
  	// rebuild this output file on the next build invocation.
  	touch(shared.JoinPath(topDir, finalOutputFile))
@@ -564,7 +589,11 @@ index 254dd25cc..53123f3a0 100644
 +	android.StartBackgroundMetrics(configuration)
 +
 +	fullRebuild := func(reason string) {
-+		fmt.Fprintf(os.Stderr, "soong_build persistent: incremental fallback (%s) -> full rebuild\n", reason)
++		// WARM-FALLBACK is the single greppable marker that the warm/incremental path
++		// did NOT engage for this build and we fell back to a full cold rebuild. The
++		// reason says exactly why. On an unfamiliar tree, `grep WARM-FALLBACK` over the
++		// build log enumerates every edit class the incremental path doesn't yet handle.
++		fmt.Fprintf(os.Stderr, "WARM-FALLBACK: %s -> full cold rebuild (resident graph discarded)\n", reason)
 +		residentBuildCtx = nil // discard the resident graph; runBuild does a cold build
 +		runBuild()
 +	}
@@ -666,7 +695,6 @@ index 254dd25cc..53123f3a0 100644
 +	ninjaDeps, err := bootstrap.RegenerateBuildActions(cmdlineArgs.Args, ctx.Context, configuration)
 +	maybeQuit(err, "")
 +	fmt.Fprintf(os.Stderr, "soong_build persistent: regenerate+write took %v\n", time.Since(tRegen))
-+	runBpgenTakeoverAfterSoong(configuration)
 +	finalOutputFile := cmdlineArgs.OutFile
 +
 +	ninjaDeps = append(ninjaDeps, configuration.ProductVariablesFileName)
@@ -678,113 +706,15 @@ index 254dd25cc..53123f3a0 100644
 +	err = writeGlobFile(ctx.EventHandler, finalOutputFile, ctx.Globs(), soongStartTime)
 +	maybeQuit(err, "")
 +	touch(shared.JoinPath(topDir, finalOutputFile))
-+}
-+
-+func runBpgenTakeoverAfterSoong(configuration android.Config) {
-+	if persistentListen != "" {
-+		trackBpgenTakeoverEnv(configuration)
-+		return
-+	}
-+	runBpgenTakeoverIfEnabled(configuration)
-+}
-+
-+func runBpgenTakeoverFromPersistentClient() {
-+	topPath, err := filepath.Abs(topDir)
-+	maybeQuit(err, "resolving top dir for bpgen")
-+	err = os.Chdir(topPath)
-+	maybeQuit(err, "changing to top dir for bpgen")
-+
-+	availableEnv := parseAvailableEnv()
-+	configuration, err := android.NewConfig(cmdlineArgs, availableEnv)
-+	maybeQuit(err, "")
-+	runBpgenTakeoverIfEnabled(configuration)
-+}
-+
-+func trackBpgenTakeoverEnv(configuration android.Config) {
-+	if !configuration.IsEnvTrue("SOONG_BPGEN") {
-+		return
-+	}
-+	configuration.Getenv("SOONG_BPGEN_BINARY")
-+	configuration.Getenv("SOONG_NINJA_SHARDS")
-+	configuration.GetenvWithDefault("SOONG_BPGEN_LOG_LEVEL", "warn")
-+	configuration.GetenvWithDefault("SOONG_BPGEN_RAYON_THREADS", "8")
-+}
-+
-+func runBpgenTakeoverIfEnabled(configuration android.Config) {
-+	if !configuration.IsEnvTrue("SOONG_BPGEN") {
-+		return
-+	}
-+	if configuration.BuildMode != android.AnalysisNoBazel {
-+		return
-+	}
-+	if !configuration.HasDeviceProduct() {
-+		maybeQuit(fmt.Errorf("SOONG_BPGEN=true requires a product build"), "")
-+	}
-+
-+	bpgenBinary := configuration.Getenv("SOONG_BPGEN_BINARY")
-+	if bpgenBinary == "" {
-+		bpgenBinary = filepath.Join("out", "host", runtime.GOOS+"-x86", "bin", "bpgen")
-+	}
-+
-+	topPath, err := filepath.Abs(topDir)
-+	maybeQuit(err, "resolving top dir for bpgen")
-+	soongOutDir, err := absolutePathUnderTop(topPath, configuration.SoongOutDir())
-+	maybeQuit(err, "resolving Soong out dir for bpgen")
-+	bpgenBinary, err = absolutePathUnderTop(topPath, bpgenBinary)
-+	maybeQuit(err, "resolving bpgen binary")
-+
-+	args := []string{
-+		"--top", topPath,
-+		"--out", soongOutDir,
-+		"--product", configuration.DeviceProduct(),
-+		"--soong-oracle-output", soongOutDir,
-+	}
-+	if shards := configuration.Getenv("SOONG_NINJA_SHARDS"); shards != "" {
-+		if _, err := strconv.Atoi(shards); err != nil {
-+			maybeQuit(fmt.Errorf("invalid SOONG_NINJA_SHARDS=%q: %w", shards, err), "")
-+		}
-+		args = append(args, "--shards", shards)
-+	}
-+	if logLevel := configuration.GetenvWithDefault("SOONG_BPGEN_LOG_LEVEL", "warn"); logLevel != "" {
-+		args = append(args, "--log-level", logLevel)
-+	}
-+	rayonThreads := configuration.GetenvWithDefault("SOONG_BPGEN_RAYON_THREADS", "8")
-+	if rayonThreads != "" {
-+		threads, err := strconv.Atoi(rayonThreads)
-+		if err != nil || threads <= 0 {
-+			maybeQuit(fmt.Errorf("invalid SOONG_BPGEN_RAYON_THREADS=%q", rayonThreads), "")
-+		}
-+	}
-+
-+	start := time.Now()
-+	fmt.Fprintf(os.Stderr, "soong_build: SOONG_BPGEN=true, rewriting ninja shards with %s\n", bpgenBinary)
-+	cmd := exec.Command(bpgenBinary, args...)
-+	cmd.Dir = topPath
-+	if rayonThreads != "" {
-+		cmd.Env = append(os.Environ(), "RAYON_NUM_THREADS="+rayonThreads)
-+	}
-+	cmd.Stdout = os.Stderr
-+	cmd.Stderr = os.Stderr
-+	if err := cmd.Run(); err != nil {
-+		maybeQuit(fmt.Errorf("bpgen takeover failed: %w", err), "")
-+	}
-+	fmt.Fprintf(os.Stderr, "soong_build: bpgen takeover completed in %v\n", time.Since(start))
-+}
-+
-+func absolutePathUnderTop(topPath, path string) (string, error) {
-+	if filepath.IsAbs(path) {
-+		return filepath.Clean(path), nil
-+	}
-+	return filepath.Abs(filepath.Join(topPath, path))
  }
  
  func writeUsedEnvironmentFile(configuration android.Config) {
 diff --git a/cmd/soong_build/persistent.go b/cmd/soong_build/persistent.go
 new file mode 100644
-index 000000000..54b7a0871
+index 000000000..3c3ed5fa3
 --- /dev/null
 +++ b/cmd/soong_build/persistent.go
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,331 @@
 +// Copyright 2026 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -851,13 +781,16 @@ index 000000000..54b7a0871
 +// into persistent mode; its value is the unix socket path.
 +const persistentSockEnv = "SOONG_PERSISTENT_SOCK"
 +
-+// persistentReuseGraphEnv, when "true", enables the EXPERIMENTAL graph-residency
-+// fast path (Phase 2): the resident server keeps the resolved+mutated Blueprint
-+// graph in memory and, on subsequent builds, skips parse + ResolveDependencies
-+// and only re-generates build actions. See the warnings on
-+// blueprint.Context.ResetBuildActionsForReanalysis -- it does not yet re-apply
-+// edited Android.bp properties through mutators, so it is for measurement and
-+// development only, not correct for arbitrary edits.
++// persistentReuseGraphEnv, when "true", enables the warm-incremental graph-residency
++// fast path: the resident server keeps the resolved+mutated Blueprint graph in memory
++// and, on a subsequent build, reparses only the changed Android.bp files, re-mutates
++// only the affected closure, regenerates only dirty modules, and rewrites only the
++// changed manifest shards. Property edits, module adds and module removes are handled
++// incrementally and have been verified byte-identical to a cold resident rebuild
++// (aosp_cf, soong-only). Anything the incremental path can't represent (an unsupported
++// mutator, a structural change it can't prove neutral, a changed product config) falls
++// back to a full cold rebuild -- logged WARM-FALLBACK -- so the output is always
++// correct, just not always fast. EXPERIMENTAL: not yet verified on Kati / vendor / Pixel.
 +const persistentReuseGraphEnv = "SOONG_PERSISTENT_REUSE_GRAPH"
 +
 +// reuseGraphMode is set once at server startup from persistentReuseGraphEnv.
@@ -1052,7 +985,6 @@ index 000000000..54b7a0871
 +			fmt.Fprintf(os.Stderr, "soong_build persistent: build failed: %s\n", resp.Err)
 +			os.Exit(1)
 +		}
-+		runBpgenTakeoverFromPersistentClient()
 +		return
 +	}
 +	fmt.Fprintf(os.Stderr, "soong_build persistent: server kept reporting stale\n")

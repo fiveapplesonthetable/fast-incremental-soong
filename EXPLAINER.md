@@ -14,6 +14,41 @@ There is also a one-page "spine" in Part V that walks through *literally everyth
 
 ---
 
+## Enabling the warm path, and what is actually verified
+
+This repo ships a working **warm-incremental `soong_build`**: edit one `Android.bp`,
+regenerate `build.ninja` in seconds, byte-identical to a clean build. It is one
+environment variable on an otherwise-normal build:
+
+```sh
+# First build: cold. Starts the resident soong_build daemon, snapshots the graph.
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing
+#   …edit an Android.bp…
+# Re-run the SAME command: warm. Reuses the resident graph, O(edit), byte-identical.
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing
+```
+
+**The whole feature is gated behind that variable.** With it unset — the default,
+and what every normal build does — the code takes the stock path and the manifest
+is byte-for-byte identical to upstream Soong. The upstream Blueprint unit tests
+pass unchanged. So merely applying the patch does not change a normal build,
+including a Kati-enabled Pixel `m`.
+
+**What was verified:** `aosp_cf_x86_64_phone-trunk_staging-userdebug`, **soong-only**
+(`m nothing`), property-edit / add / remove on `frameworks/base/Android.bp`, warm
+output `cmp`-identical to a cold resident rebuild of the same tree.
+
+**What was NOT verified (honest residual risk):** Kati-enabled full `m`; vendor /
+proprietary modules; larger graphs and extra `PRODUCT_SOONG_NAMESPACES`; any
+non-`aosp_cf` product. The design fails *safe* there, not *wrong*: anything the warm
+path can't represent incrementally returns `ErrFallbackToFullBuild` and does a full
+cold rebuild (byte-identical to stock), logging a greppable `WARM-FALLBACK: <reason>`.
+To trust a new edit class on your tree, run the warm edit, then a
+`SOONG_PERSISTENT_REUSE_GRAPH=true` cold rebuild of the same tree, and `cmp` the
+shards. Part IX has the mechanism; Part X has what remains.
+
+---
+
 ## Table of Contents
 
 * **Prologue.** Why this is a book.
@@ -1070,9 +1105,12 @@ because it keeps nothing in memory between runs. Those two are the remaining
 floors (chapters 31-33, 60).
 
 The cost is O(edit) only for the analysis. The full wall still carries the
-product-config and ninja-reload floors, and adding or removing a module is not
-warm at all yet -- it falls back to a full rebuild because the whole-graph
-singletons re-aggregate over every module (chapters 45, 58).
+product-config and ninja-reload floors. Adding and removing a module are now warm
+too (and byte-identical to a cold resident rebuild), but they are a *membership
+change*: the whole-graph singletons re-aggregate over the new module set, so an
+add/remove is dominated by singleton regeneration (~24 s of the analysis) rather
+than being the few-seconds a property edit is. Folding those singletons
+incrementally is the next lever (chapters 45, 58).
 
 ## 29. The soong_ui floor
 
@@ -1410,13 +1448,19 @@ The pain concentrates when a module is added or removed. Adding a module means:
 
 To produce these correctly, you have to re-run the singletons or compute the deltas directly.
 
-Re-running fails today: Soong's singletons assume `GenerateBuildActions` runs once. They use `sync.Once`. They set providers. They consume state. A naive "reset and re-run" produces empty output.
+Re-running naively fails: Soong's singletons assume `GenerateBuildActions` runs once. They use `sync.Once`. They set providers. They consume state. A naive "reset and re-run" produces empty output or double-sets a provider and panics. **This is now solved** by resetting each single-use singleton's generate-state (its `actionDefs`, its providers, and its run guards) before re-running it over the new module set on a membership change — so add and remove are warm and byte-identical to a cold resident rebuild. What is *not* yet done is making that re-run cheap (below).
 
 The graph side of a membership change is already built — the resident server has `IncrementalAddModules` / `IncrementalRemoveModules`. The only blocker is the singletons. The aggregations are per-module *additive*: the phony singleton is literally `VisitAllModuleProxies(m -> for k,v in m.Phonies: phonyMap[k] += v)`, so adding a module appends its entries and removing one drops them, with no other module's contribution changing. `module-info` has the same shape — one entry per module.
 
 The open piece is to express each singleton as an **incremental fold**: record every module's per-singleton contribution during the full build; define a per-singleton fold function (`sort-and-concat` for `module-info`, set-union for `all-modules`, graph-edge-merge for license-graph); on a membership change, just add/remove the contribution and recompute the fold. This is tractable: the additive singletons fold trivially. Only pathological non-additive singletons (a global sorted index, cross-module dedup with global numbering, a whole-tree hash) and the license graph's transitive closure are non-trivial.
 
-Until that lands, add/remove falls back: on any membership change (`added > 0` or `removed > 0`) the warm path discards the resident graph and does a full cold rebuild (~136s). Correct, slow.
+Until that lands, add/remove is warm but not cheap: on a membership change the
+whole-graph singletons are reset and **fully re-run** over the new module set
+(~24 s of the analysis), rather than folding just the one added/removed
+contribution. The output is byte-identical to a cold resident rebuild; only the
+cost is non-incremental. (The soong-only phony singleton already does a partial
+pure-add fold — it keeps the cached module phonies and merges only the added
+module, falling back to a full scan only if a singleton-emitted phony changed.)
 
 ## 46. Providers and propagation
 
@@ -1744,7 +1788,7 @@ Result: dropsrc shards' position comments match cold. Corpus passes.
 
 ## 56. The standalone engine
 
-In parallel with the Soong patches, I built a separate, clean-slate incremental computation engine. It lives at `build/blueprint/incr/`. About 700 lines of Go plus a demo driver.
+In parallel with the Soong patches, I built a separate, clean-slate incremental computation engine — about 700 lines of Go plus a demo driver. It is a *separate exploration of a future redesign* and is **not part of the patches in this repo** (the patches are the warm-incremental Soong daemon only); it is described here because it shows what enforcing the pure-function invariant by construction looks like.
 
 The engine's design:
 

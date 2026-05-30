@@ -4,28 +4,102 @@ Make AOSP's analysis phase incremental: edit one `Android.bp`, regenerate
 `build.ninja` in seconds instead of re-analyzing the whole tree — **byte-identical
 to a clean build**, measured on real AOSP.
 
-## Result (real AOSP, `aosp_cf_x86_64_phone-trunk_staging-userdebug`)
+## What it does
 
-A resident `soong_build` daemon keeps the resolved+mutated graph in RAM. A warm
-`.bp` edit reparses only the changed file, re-mutates only the affected closure,
-regenerates only dirty modules, and rewrites only the manifest shards that changed.
-Every warm result is verified byte-identical to a cold rebuild (`cmp`, all shards).
+A resident `soong_build` daemon keeps the resolved + mutated module graph in RAM.
+On a warm `.bp` edit it reparses only the changed file, re-mutates only the
+affected closure, regenerates only dirty modules, and rewrites only the manifest
+shards that changed — instead of re-parsing 14k+ `Android.bp` files and
+re-analyzing the whole module graph from scratch.
 
-| edit | cold | warm | byte-identical |
-|---|---:|---:|---|
-| property edit (existing module) | 131 s analysis | **~4.4 s** | yes |
-| add a module | (crash / full rebuild) | **warm, 1 shard** | yes |
-| remove a module | full rebuild | **warm, 1 shard** | yes |
+Every warm result is verified **byte-identical** to a cold rebuild of the same
+tree (`cmp`, every ninja + `.mk` shard).
 
-"Analysis" = producing the updated `build.ninja` (the part this work makes O(edit)).
-The full `m` wall (~20 s for an edit) also carries product-config (`dumpvars`) and a
-stock-ninja 5.6 GB manifest reload — separate floors, not yet removed.
+## How to enable it
+
+It is a single environment variable on an otherwise-normal build:
+
+```sh
+# First build: cold. Starts the resident soong_build daemon and snapshots the graph.
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing
+
+#   …edit an Android.bp…
+
+# Re-run the SAME command: warm. Reuses the resident graph, O(edit), byte-identical.
+SOONG_PERSISTENT_REUSE_GRAPH=true m nothing
+```
+
+`m nothing` builds just the ninja manifest (the analysis phase this work makes
+incremental); use any target you like. `SOONG_NINJA_SHARDS=N` (default 50/10)
+controls manifest shard granularity. **With the variable unset (the default),
+the build is byte-for-byte stock** — see "Will this work on my tree?".
+
+## Result (real AOSP, `aosp_cf_x86_64_phone-trunk_staging-userdebug`, soong-only)
+
+Measured on an edit to **`frameworks/base/Android.bp`** (the realistic worst case:
+a large, central mega-`Android.bp`), build target `nothing` (analysis only):
+
+| edit | reparse | what the warm rebuild does | byte-identical |
+|---|--:|---|:--:|
+| **property edit** (existing module) | 0.40 s | 13 modules in the edited closure regenerated; **singletons kept**; delta write skips 34/50 ninja + 50/50 incremental shards | yes |
+| **add a module** | 0.40 s | graph reused; added module regenerated + whole-graph singletons re-run; delta write skips 47/50 ninja + 50/50 incremental shards | yes |
+| **remove a module** | 0.40 s | removed module's shard force-rewritten; singletons re-run | yes |
+
+"Byte-identical" means **warm-resident == cold-resident**: a warm rebuild produces
+exactly the same `build.ninja` as a from-scratch (cold) resident build of the same
+edited tree. That is the guarantee that proves the incremental analysis is exact.
+
+The dominant warm cost on an **add/remove** is **singleton regeneration** (an add
+or remove is a membership change, so whole-graph singletons such as the
+module-info and phony aggregations re-run). A **property edit keeps singletons**
+and is cheaper. The reparse itself is ~0.4 s (one file) versus a full-tree reparse
+(~4–5 s), and the manifest write is O(edit) (only changed shards rewritten).
+
+### Two subtle correctness mechanisms (so warm == cold holds for these too)
+
+- **Order-only dedup is recomputed from immutable inputs every build**, and any
+  *clean* module whose emitted order-only deps flip because a shared key crossed the
+  dedup-vs-keep threshold (a dirty module added/dropped a use of it) is forced to be
+  re-serialized — so the delta write never keeps a stale shard for it.
+- **Singleton phony contributions are recomputed fresh every build**; the pure-add
+  fold (which reuses the cached module phonies) is only taken when those singleton
+  phonies are unchanged, otherwise the phony makefile is rebuilt fully. A singleton
+  that aggregates over all modules can't silently go stale on an add.
+
+## Will this work on my tree? (Pixel / vendor / Kati — read this)
+
+**With `SOONG_PERSISTENT_REUSE_GRAPH` unset (default): yes, nothing changes.**
+Every warm-specific behavior is gated behind that variable (`residentNinjaLayout()`
+/ `keepPristineModules`). A normal build — including a Kati-enabled Pixel `m` — takes
+the stock code path and produces a byte-identical manifest. The upstream Blueprint
+unit tests pass unchanged, which is the evidence for this.
+
+**With the variable on, on a config other than the one tested:** it is designed to
+fail *safe*, not *wrong*. Anything the warm path can't represent incrementally (an
+unsupported mutator, a transition, a structural change it can't prove neutral)
+returns `ErrFallbackToFullBuild` and does a **full cold rebuild** — byte-identical
+to stock. So the worst realistic outcome on an untested config is "this edit wasn't
+fast," not "wrong ninja." Every fallback logs a greppable `WARM-FALLBACK: <reason>`
+so you can see exactly which edit classes your tree doesn't yet handle incrementally.
+
+**What was verified:** `aosp_cf_x86_64_phone`, **soong-only** (`m nothing`),
+property-edit / add / remove on `frameworks/base/Android.bp`, byte-identical.
+
+**What was NOT tested (real residual risk):**
+- **Kati-enabled full `m`** (only soong-only `nothing` was measured). The warm path
+  only regenerates soong's ninja; Kati is orthogonal, but unexercised here.
+- **Vendor / proprietary modules, larger graphs, extra `PRODUCT_SOONG_NAMESPACES`** —
+  may hit mutators/variants the warm path falls back on.
+
+**To validate on your tree:** run a warm edit, then a `SOONG_PERSISTENT_REUSE_GRAPH=true`
+cold rebuild of the same tree, and `cmp` the ninja + `.mk` shards (what the test
+scripts do). If they match, that edit class is exact on your config.
 
 ## What's here
 
 - **`EXPLAINER.md`** — a long-form walkthrough of the whole AOSP build system
-  (Make → Ninja → Kati → Soong/Blueprint) and exactly how the incremental analysis
-  works, where the time goes, and what's left. Start here.
+  (Make → Kati → Ninja → Soong/Blueprint) and exactly how the incremental analysis
+  works, where the time goes, what is gated, and what is left. Start here.
 - **`patches/`** — the change, as `git am`-able commits against upstream:
   - `0001-build-soong.patch` (apply in `build/soong`, onto `f389fa2a2`)
   - `0002-build-blueprint.patch` (apply in `build/blueprint`, onto `c39c8a4`)
@@ -33,21 +107,25 @@ stock-ninja 5.6 GB manifest reload — separate floors, not yet removed.
 
 ## How it works (one paragraph)
 
-Graph residency (a persistent process) is the thing that makes O(edit) possible — a
-batch tool that exits every time has nothing in memory to skip *to*. On top of that:
+Graph residency (a persistent process) is what makes O(edit) possible — a batch
+tool that exits every build has nothing in memory to skip *to*. On top of that:
 changed-file-only reparse; incremental re-mutation of the affected closure;
 content-addressed (hash-of-identity) shard assignment so adding/removing a module
 leaves every other module in its shard and the manifest write stays O(edit);
 single-use singletons reset before re-run on a membership change; and the largest
-singleton output (`soong_phony_targets.mk`, 600 MB) sharded so a warm edit rewrites
-only the shards that changed.
+singleton output (the soong-only phony makefile) sharded so a warm edit rewrites
+only the shards that changed. Every one of these is gated so a non-resident build
+is byte-identical to upstream; the warm and cold *resident* manifests are
+byte-identical to each other.
 
 ## Honest caveats
 
-- Local / experimental work. Not in upstream AOSP; not pushed there.
+- Local / experimental. Not in upstream AOSP; not pushed there.
 - Requires the resident daemon (`SOONG_PERSISTENT_REUSE_GRAPH=true`).
-- Byte-identity verified for property edits to existing modules plus add/remove of
-  a leaf module; not an exhaustive edit-class corpus.
-- The full `m` wall is not single-digit yet — that needs a resident ninja (avoid the
-  5.6 GB reload), a dumpvars cache, and finishing incremental singleton emit
-  (phony done; androidmk next). See `EXPLAINER.md`.
+- Byte-identity verified for property edit / add / remove of a leaf-ish module on
+  `frameworks/base/Android.bp`, soong-only, on `aosp_cf_x86_64_phone`. Not an
+  exhaustive edit-class corpus, and not yet verified on Kati / vendor / Pixel.
+- The full `m` wall is not single-digit yet: an add/remove is dominated by
+  singleton regeneration, and the outer build still carries product-config
+  (`dumpvars`) and a stock-ninja manifest reload. See `EXPLAINER.md` for the
+  remaining floors and the proposed designs to remove them.
