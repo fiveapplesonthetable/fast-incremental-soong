@@ -1131,7 +1131,16 @@ Eliminating it needs a resident ninja: a long-lived process that keeps the
 parsed DAG in memory and, on each build, re-reads only the shards that changed
 and patches its in-RAM graph, instead of reloading the whole manifest. n2 (a
 Rust ninja reimplementation) can run this way. This is not engaged in the
-measured warm path above; the ~5 s reload is stock ninja.
+ measured warm path above; the ~5 s reload is stock ninja.
+
+Verified: the resident-n2 path as it exists does NOT work. The n2 server starts
+and tries to load the 5.6 GB manifest into RAM, but the load takes over four
+minutes (it times out), so it never reaches the incremental-splice fast path and
+falls back to stock ninja. Stock ninja reloads the same manifest in ~4 s -- about
+50x faster than n2's load -- so the resident path is currently far worse, not
+better. Making it viable is a Rust performance problem in n2's manifest parse and
+DAG construction, not a wiring change; it is the biggest single unsolved wall
+floor and a genuinely hard one.
 
 # Part VII — The Java pipeline and friends
 
