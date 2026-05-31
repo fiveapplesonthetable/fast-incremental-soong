@@ -469,7 +469,7 @@ index 105477a05..d4950b046 100644
  }
  
 diff --git a/android/singleton.go b/android/singleton.go
-index 97e561466..d26fd83a3 100644
+index 97e561466..7ba1131d0 100644
 --- a/android/singleton.go
 +++ b/android/singleton.go
 @@ -21,6 +21,7 @@ import (
@@ -493,7 +493,7 @@ index 97e561466..d26fd83a3 100644
  	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
  	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
  
-@@ -200,6 +207,48 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext)
+@@ -200,6 +207,62 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext)
  	}
  }
  
@@ -539,10 +539,24 @@ index 97e561466..d26fd83a3 100644
 +	return h, emitted
 +}
 +
++// IncrementalGatingProviders forwards a singleton's declared gating providers (the
++// providers a module must set for the singleton to emit anything for it) to the
++// blueprint incremental layer, which uses them to skip the singleton on a warm add
++// whose changed modules set none of them -- without running it. A singleton that does
++// not declare gating providers falls back to the run-based contribution probe.
++func (s *singletonAdaptor) IncrementalGatingProviders() []blueprint.AnyProviderKey {
++	if g, ok := s.Singleton.(interface {
++		IncrementalGatingProviders() []blueprint.AnyProviderKey
++	}); ok {
++		return g.IncrementalGatingProviders()
++	}
++	return nil
++}
++
  func (s *singletonAdaptor) BuildParamsForTests() []BuildParams {
  	return s.buildParams
  }
-@@ -358,6 +407,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
+@@ -358,6 +421,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
  	s.SingletonContext.VisitAllModuleProxies(visitProxyAdaptor(visit))
  }
  
@@ -1990,6 +2004,32 @@ index 000000000..e18ad9fd4
 +  ninja for `IncrementalModule`-tagged modules; extending it to keep all blocks in
 +  RAM and splice only the dirty ones (feeding the resident executor directly)
 +  removes the 481 MB rewrite. This is the in-RAM incremental manifest.
+diff --git a/test_suites/test_suites.go b/test_suites/test_suites.go
+index 9b7961ee0..27b81f8de 100644
+--- a/test_suites/test_suites.go
++++ b/test_suites/test_suites.go
+@@ -56,6 +56,21 @@ func testSuiteFilesFactory() android.Singleton {
+ 
+ type testSuiteFiles struct{}
+ 
++// IncrementalGatingProviders declares the providers a module must set for this
++// singleton to emit anything for it: a module is part of the test-suite output only if
++// it is in a test suite (TestSuiteInfo) or is a (compatibility) test-suite package. A
++// warm add whose changed modules set none of these cannot change the output, so the
++// blueprint incremental layer keeps this singleton's resident actions without running
++// it. (Reading CommonModuleInfo / make names for every module does not gate emission --
++// those only matter for modules already in a suite.)
++func (t *testSuiteFiles) IncrementalGatingProviders() []blueprint.AnyProviderKey {
++	return []blueprint.AnyProviderKey{
++		android.TestSuiteInfoProvider,
++		compatibilitySuitePackageProvider,
++		testSuitePackageProvider,
++	}
++}
++
+ func (t *testSuiteFiles) GenerateBuildActions(ctx android.SingletonContext) {
+ 	hostOutTestCases := android.PathForHostInstall(ctx, "testcases")
+ 	// regularInstalledFiles maps from test suite name -> all installed files from all modules
 diff --git a/ui/build/config.go b/ui/build/config.go
 index 1d793ad45..657933f62 100644
 --- a/ui/build/config.go

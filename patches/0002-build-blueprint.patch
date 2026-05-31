@@ -5729,10 +5729,10 @@ index 0000000..ef46cf6
 +}
 diff --git a/incremental_singleton_probe.go b/incremental_singleton_probe.go
 new file mode 100644
-index 0000000..a6dd375
+index 0000000..133fe54
 --- /dev/null
 +++ b/incremental_singleton_probe.go
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,255 @@
 +// Copyright 2025 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5870,6 +5870,42 @@ index 0000000..a6dd375
 +	c.residentProviderHashes = snap
 +}
 +
++// gatingProviderSingleton is implemented by a singleton (in practice the soong
++// singletonAdaptor, forwarding from the underlying soong Singleton) that declares the
++// providers a module must set for the singleton to emit anything for it. testsuites,
++// for example, emits only for modules with a TestSuiteInfo provider. If a warm
++// rebuild's changed modules set none of the declared providers, the singleton's
++// per-module emission set is unchanged, so its output is unchanged and it is restorable
++// WITHOUT running it -- the O(edit) fast path that avoids the GC-bound contribution
++// probe for the whole-graph singletons that gate on a provider.
++type gatingProviderSingleton interface {
++	IncrementalGatingProviders() []AnyProviderKey
++}
++
++// gatingRestorableOnAdd decides a singleton purely from its declared gating providers:
++// it is restorable iff none of the changed modules sets one. ok=false means the
++// singleton declares no gating providers, so the caller falls back to the run-based
++// probe. A singleton that declares gating providers is never probed -- the cheap set
++// check is exact for it (the author guarantees it emits only for gated modules).
++func (c *Context) gatingRestorableOnAdd(info *singletonInfo, probeSet []*moduleInfo) (restorable, ok bool) {
++	gs, isGating := info.singleton.(gatingProviderSingleton)
++	if !isGating {
++		return false, false
++	}
++	keys := gs.IncrementalGatingProviders()
++	if len(keys) == 0 {
++		return false, false
++	}
++	for _, m := range probeSet {
++		for _, k := range keys {
++			if id := k.provider().id; id < len(m.providers) && m.providers[id] != nil {
++				return false, true // a changed module gates this singleton -> re-run
++			}
++		}
++	}
++	return true, true
++}
++
 +// singletonRestorableOnAdd reports whether a whole-graph singleton can keep its
 +// resident build actions across this membership rebuild -- i.e. none of the
 +// regenerated modules (added + changed) contributes to it. Only sound when no module
@@ -5879,12 +5915,20 @@ index 0000000..a6dd375
 +func (c *Context) singletonRestorableOnAdd(info *singletonInfo, config interface{},
 +	liveGlobals *liveTracker, probeSet []*moduleInfo) bool {
 +
++	if len(probeSet) == 0 {
++		return false
++	}
++
++	// Fast path: a singleton that declares its gating providers is decided by a cheap
++	// O(edit) set check -- no run, no GC pressure. This is the redesign that removes the
++	// probe cost for the heavy whole-graph singletons.
++	if restorable, ok := c.gatingRestorableOnAdd(info, probeSet); ok {
++		return restorable
++	}
++
 +	pc, ok := info.singleton.(probeContributor)
 +	if !ok {
 +		return false // can't probe -> must re-run
-+	}
-+	if len(probeSet) == 0 {
-+		return false
 +	}
 +
 +	// Run the singleton's probe over the regenerated modules and over the empty set.
