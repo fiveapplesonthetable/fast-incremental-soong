@@ -159,7 +159,7 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..906b371 100644
+index 199171c..85de246 100644
 --- a/context.go
 +++ b/context.go
 @@ -19,11 +19,9 @@ import (
@@ -223,7 +223,7 @@ index 199171c..906b371 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +223,98 @@ type Context struct {
+@@ -190,6 +223,105 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -319,10 +319,17 @@ index 199171c..906b371 100644
 +	// usually is once the contribution probe has kept all but a few singletons.
 +	singletonsHash uint64
 +
++	// cachedOrderOnlyPhonys is the order-only-dep dedup result (the phony build defs)
++	// from the last build. deduplicateOrderOnlyDepsResident reuses it -- skipping the
++	// O(tree) recount and per-module rewrite -- when no genuinely-changed module
++	// contributed an order-only dep, so the dedup decision cannot have changed. nil
++	// until the first resident dedup.
++	cachedOrderOnlyPhonys *localBuildActions
++
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +486,21 @@ type moduleInfo struct {
+@@ -361,6 +493,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -344,7 +351,7 @@ index 199171c..906b371 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +552,12 @@ type moduleInfo struct {
+@@ -412,6 +559,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -357,7 +364,7 @@ index 199171c..906b371 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,10 +934,6 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +941,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
@@ -368,7 +375,7 @@ index 199171c..906b371 100644
  func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
  	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
  		return err
-@@ -2936,7 +3078,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2936,7 +3085,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -382,7 +389,7 @@ index 199171c..906b371 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3138,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3145,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -414,7 +421,7 @@ index 199171c..906b371 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3178,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3185,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -436,7 +443,7 @@ index 199171c..906b371 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3508,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3515,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -455,7 +462,7 @@ index 199171c..906b371 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3371,6 +3558,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3565,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -476,7 +483,7 @@ index 199171c..906b371 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,93 +3593,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3600,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -574,7 +581,7 @@ index 199171c..906b371 100644
  			return false
  		})
  
-@@ -3487,6 +3607,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3487,6 +3614,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	errs = append(errs, visitErrs...)
  
@@ -585,7 +592,7 @@ index 199171c..906b371 100644
  	return deps, errs
  }
  
-@@ -3597,8 +3721,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3728,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -599,7 +606,7 @@ index 199171c..906b371 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3620,7 +3747,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3620,7 +3754,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  }
  
  func (c *Context) generateParallelSingletonBuildActions(config interface{},
@@ -609,7 +616,7 @@ index 199171c..906b371 100644
  
  	c.BeginEvent("generateParallelSingletonBuildActions")
  	defer c.EndEvent("generateParallelSingletonBuildActions")
-@@ -3654,6 +3782,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3654,6 +3789,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  			// Skip any singletons registered with parallel=false.
  			continue
  		}
@@ -620,7 +627,7 @@ index 199171c..906b371 100644
  		wg.Add(1)
  		go func(inf *singletonInfo) {
  			defer wg.Done()
-@@ -3670,33 +3802,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3670,33 +3809,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
@@ -692,7 +699,7 @@ index 199171c..906b371 100644
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,8 +3859,92 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,8 +3866,92 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -785,7 +792,7 @@ index 199171c..906b371 100644
  		c.BeginEvent("singleton:" + info.name)
  		defer c.EndEvent("singleton:" + info.name)
  		newDeps, newErrs := c.generateOneSingletonBuildActions(config, info, liveGlobals)
-@@ -3722,11 +3957,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3722,11 +3964,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -806,7 +813,7 @@ index 199171c..906b371 100644
  
  	for _, info := range singletons {
  		if !info.parallel {
-@@ -4596,7 +4838,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+@@ -4596,7 +4845,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -824,7 +831,7 @@ index 199171c..906b371 100644
  			return
  		}
  	})
-@@ -4849,10 +5100,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5107,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -837,7 +844,7 @@ index 199171c..906b371 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
-@@ -4900,7 +5150,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4900,7 +5157,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
@@ -853,7 +860,7 @@ index 199171c..906b371 100644
  		return err
  	}
  
-@@ -4914,9 +5171,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5178,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
@@ -895,7 +902,7 @@ index 199171c..906b371 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5234,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5241,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -971,7 +978,7 @@ index 199171c..906b371 100644
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5374,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5381,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -985,7 +992,7 @@ index 199171c..906b371 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +5457,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5464,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -1022,7 +1029,7 @@ index 199171c..906b371 100644
  			return err
  		}
  	}
-@@ -5270,39 +5635,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5642,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -4657,10 +4664,10 @@ index 0000000..71a60b0
 +}
 diff --git a/incremental_ninja.go b/incremental_ninja.go
 new file mode 100644
-index 0000000..31b31f0
+index 0000000..ef46cf6
 --- /dev/null
 +++ b/incremental_ninja.go
-@@ -0,0 +1,1027 @@
+@@ -0,0 +1,1059 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5575,7 +5582,32 @@ index 0000000..31b31f0
 +			return false
 +		})
 +
-+	return &localBuildActions{buildDefs: phonys}
++	result := &localBuildActions{buildDefs: phonys}
++	c.cachedOrderOnlyPhonys = result
++	return result
++}
++
++// orderOnlyDedupReusable reports whether the order-only-dep dedup result from the
++// previous build is still exact, so deduplicateOrderOnlyDepsResident can skip its
++// O(tree) recount + per-module rewrite. The dedup decision is purely a function of how
++// many build statements use each order-only key; only a genuinely-changed (regenerated
++// with changed output) or added module can change those counts. If none of them emits
++// an order-only dep -- the common case for a no-op add such as a cc_defaults -- no count
++// changed, the decision is unchanged, every clean module's emitted order-only is still
++// correct, and the cached phonys are byte-exact.
++func (c *Context) orderOnlyDedupReusable() bool {
++	if c.dirtyModules == nil || c.genuinelyChangedModules == nil ||
++		c.cachedOrderOnlyPhonys == nil || len(c.incrementalRemovedKeys) != 0 {
++		return false
++	}
++	for m := range c.genuinelyChangedModules {
++		for _, def := range m.actionDefs.buildDefs {
++			if def.OrderOnlyOriginal.Len() > 0 {
++				return false
++			}
++		}
++	}
++	return true
 +}
 +
 +// deduplicateOrderOnlyDepsResident recomputes the order-only dedup decision
@@ -5587,6 +5619,13 @@ index 0000000..31b31f0
 +// reversible). This is the "generate is a pure, content-addressed function of the
 +// resolved graph" invariant applied to order-only dedup.
 +func (c *Context) deduplicateOrderOnlyDepsResident(modules []*moduleInfo) *localBuildActions {
++	if c.orderOnlyDedupReusable() {
++		// No genuinely-changed module contributed an order-only dep, so no key's use
++		// count changed: the dedup decision, every clean module's already-correct
++		// emitted order-only, and the phony set are all unchanged. Reuse the cached
++		// phonys and skip the O(tree) recount + per-module rewrite.
++		return c.cachedOrderOnlyPhonys
++	}
 +	type keyInfo struct {
 +		count       int
 +		incremental bool

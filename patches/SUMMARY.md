@@ -45,7 +45,7 @@ scale). The manifest write is O(edit): only shards containing a changed module a
 rewritten. On an **add** the warm cost used to be dominated by **singleton
 regeneration** (a membership change re-runs whole-graph aggregations); the
 **contribution probe** now skips the singletons the added module doesn't surface,
-dropping the f/b add's regenerate+write from 17.2 s to ~6.5 s (65 of 66 singletons
+dropping the f/b add's regenerate+write from 17.2 s to ~6.2 s (65 of 66 singletons
 skipped, byte-identical). A **property edit keeps singletons** and is cheaper. A
 **remove** does not yet probe-skip (a removal subtracts a contribution the probe
 cannot observe) — see below.
@@ -104,7 +104,7 @@ build/blueprint (base c39c8a4):
 A property edit keeps singletons and is cheap. An **add/remove** is a membership
 change, so the whole-graph singletons re-run. A **singleton contribution probe** now
 skips the ones the added module doesn't actually surface, and the manifest write was
-made O(edit), dropping the f/b add regen+write from **17.2 s to ~6.5 s**,
+made O(edit), dropping the f/b add regen+write from **17.2 s to ~6.2 s**,
 byte-identical (467/467 shards). On the f/b `cc_defaults` add, **65 of 66 singletons
 are skipped** -- testsuites (5.5 s), soongonlyandroidmk (2.9 s), all_teams,
 artifact_path all skip; only `bootstrap` genuinely re-runs. Current breakdown:
@@ -115,9 +115,10 @@ singleton probe   ~2.5 s  throwaway singleton runs over {changed-set} (+ {empty-
                           contention: soong's OncePer is a lock-free sync.Map. The
                           floor is GC pressure from the per-run allocation (the same
                           thing that caps the real singleton pass at ~5x parallelism).
-manifest write    ~3.5 s  global deduplicateOrderOnlyDeps (~1.1 s) + the one O(tree)
-                          shardModulesStable assignment (~1 s) + writing the 1-2 dirty
-                          shards. The shard write itself is now O(edit).
+manifest write    ~2.4 s  the O(tree) shardModulesStable assignment (~0.7 s, inline
+                          FNV) + sort (~0.2 s) + writing the 1-2 dirty shards. The
+                          shard write and the order-only dedup are now O(edit) (the
+                          dedup is cached across a no-op add).
 bootstrap + misc  ~0.6 s
 ```
 
@@ -176,7 +177,7 @@ for the rare singleton the probe can't skip.
 
 The singleton wall — the cost that made add/remove expensive — is gone: 65/66
 singletons skip and the 11.3 s of re-aggregation collapses to a 4.3 s probe + ~1 s.
-With the write then made O(edit) (below), the f/b add is **~6.5 s** byte-identical,
+With the write then made O(edit) (below), the f/b add is **~6.2 s** byte-identical,
 two near-equal costs left, each a further CL:
 
 1. **Probe overhead ~3.3 s.** The probe is 132 throwaway singleton runs that serialise
