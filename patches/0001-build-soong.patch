@@ -469,10 +469,18 @@ index 105477a05..d4950b046 100644
  }
  
 diff --git a/android/singleton.go b/android/singleton.go
-index 97e561466..ab2f300dc 100644
+index 97e561466..ea0abbe0b 100644
 --- a/android/singleton.go
 +++ b/android/singleton.go
-@@ -87,6 +87,12 @@ type SingletonContext interface {
+@@ -21,6 +21,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/google/blueprint"
++	"github.com/google/blueprint/proptools"
+ )
+ 
+ // SingletonContext
+@@ -87,6 +88,12 @@ type SingletonContext interface {
  	VisitAllModulesBlueprint(visit func(blueprint.Module))
  	VisitAllModules(visit func(Module))
  	VisitAllModuleProxies(visit func(proxy ModuleProxy))
@@ -485,7 +493,52 @@ index 97e561466..ab2f300dc 100644
  	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
  	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
  
-@@ -358,6 +364,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
+@@ -200,6 +207,44 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext)
+ 	}
+ }
+ 
++// ProbeContribution implements blueprint's contribution-probe interface: it runs the
++// singleton over the (restricted) modules visible through ctx in a fully throwaway
++// adaptor whose buildParams/dists/phonies are never committed to global state, and
++// returns a hash of everything it emitted. The blueprint incremental layer runs it
++// twice on a warm membership rebuild -- once over the regenerated modules and once over
++// the empty set -- and skips the singleton when the two hashes match (the regenerated
++// modules add nothing the singleton wouldn't emit anyway; see
++// incremental_singleton_probe.go). Comparing against the empty-set baseline (rather than
++// asking "did it emit anything") is what lets a whole-graph singleton like testsuites,
++// which touches its internal maps for every module but only emits per test suite, be
++// skipped on the add of a non-test module. A panic is surfaced to the caller, which
++// treats it as "differs" and falls back to a real re-run.
++func (s *singletonAdaptor) ProbeContribution(ctx blueprint.SingletonContext) uint64 {
++	sctx := &singletonContextAdaptor{
++		SingletonContext: ctx,
++		phonies:          make(phonyMap),
++	}
++	if sctx.Config().captureBuild {
++		sctx.ruleParams = make(map[blueprint.Rule]blueprint.RuleParams)
++	}
++	s.Singleton.GenerateBuildActions(sctx)
++	// Nothing above is committed: s.buildParams is untouched, dists are not appended to
++	// the global sink, and no SingletonPhonyProvider is set. Hash and discard. The
++	// tolerant hash skips Go funcs carried by Configurable so the value is stable.
++	sig := struct {
++		Build   []BuildParams
++		Dists   []dist
++		Phonies phonyMap
++	}{sctx.buildParams, sctx.dists, sctx.phonies}
++	h, err := proptools.CalculateHashTolerant(&sig)
++	if err != nil {
++		// Unhashable output -> return a value that won't match the empty-set baseline,
++		// forcing a conservative re-run.
++		return ^uint64(0)
++	}
++	return h
++}
++
+ func (s *singletonAdaptor) BuildParamsForTests() []BuildParams {
+ 	return s.buildParams
+ }
+@@ -358,6 +403,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
  	s.SingletonContext.VisitAllModuleProxies(visitProxyAdaptor(visit))
  }
  

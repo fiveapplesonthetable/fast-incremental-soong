@@ -37,15 +37,18 @@ is gated behind `residentNinjaLayout()` (the resident-mode flag). Therefore:
 | edit | reparse | singletons | delta write | byte-identical |
 |---|--:|---|---|:--:|
 | property edit | 0.40 s | kept | 13 modules regenerated; 34/50 ninja + 50/50 incr shards skipped | yes |
-| add a module | 0.49 s | re-run | 47/50 ninja + 50/50 incr shards skipped; phonys kept | yes |
+| add a module | 0.49 s | 65/66 probe-skipped | 47/50 ninja + 50/50 incr shards skipped; phonys kept | yes |
 | remove a module | 0.47 s | re-run | 47/50 ninja + 49/50 incr skipped; removed module's shard force-rewritten | yes |
 
 Reparse is one changed file (~0.4 s) versus a full-tree reparse (~4–5 s at AOSP
 scale). The manifest write is O(edit): only shards containing a changed module are
-rewritten. On an **add/remove** the warm cost is dominated by **singleton
-regeneration** (a membership change re-runs whole-graph aggregations like the
-module-info and phony singletons); a **property edit keeps singletons** and is
-cheaper.
+rewritten. On an **add** the warm cost used to be dominated by **singleton
+regeneration** (a membership change re-runs whole-graph aggregations); the
+**contribution probe** now skips the singletons the added module doesn't surface,
+dropping the f/b add's regenerate+write from 17.2 s to 9.8 s (65 of 66 singletons
+skipped, byte-identical). A **property edit keeps singletons** and is cheaper. A
+**remove** does not yet probe-skip (a removal subtracts a contribution the probe
+cannot observe) — see below.
 
 Two subtle correctness mechanisms keep warm == cold for these too: (1) order-only
 dedup is recomputed from immutable inputs every build, and a clean module whose
@@ -86,30 +89,67 @@ build/blueprint (base c39c8a4):
                                   (graph residency, content-addressed shard layout,
                                   O(edit) delta write) — kept out of context.go so the
                                   feature is additive and merges cleanly
+  incremental_singleton_probe.go  NEW FILE: the singleton contribution probe (skip
+                                  whole-graph singletons an add doesn't surface),
+                                  the genuinely-changed probe set (tolerant
+                                  provider-value hash), the probeContributor interface
   context.go                      thin call-sites into incremental_ninja.go + the
-                                  residentNinjaLayout() gate (stock path unchanged)
+                                  residentNinjaLayout() gate + the singleton probe
+                                  membership gate (stock path unchanged)
   incremental_mutation_test.go    byte-identical edit corpus
   ninja_defs.go, provider.go, singleton_ctx.go, name_interface.go, …  supporting
 
 ## Add/remove cost: where the ~24 s goes, and the incremental-singleton fold
 
 A property edit keeps singletons and is cheap. An **add/remove** is a membership
-change, so the whole-graph singletons re-run. With the phony fold landed, the f/b
-add regen+write is **17.2 s** (467/467 shards byte-identical to a cold resident
-build). Fully profiled breakdown (per-singleton timers, this is the current state,
-not an estimate):
+change, so the whole-graph singletons re-run. A **singleton contribution probe** now
+skips the ones the added module doesn't actually surface, dropping the f/b add
+regen+write from **17.2 s to 9.8 s**, byte-identical (467/467 shards). On the f/b
+`cc_defaults` add, **65 of 66 singletons are skipped** -- testsuites (5.5 s),
+soongonlyandroidmk (2.9 s), all_teams, artifact_path all skip; only `bootstrap`
+genuinely re-runs. Fully profiled current breakdown:
 
 ```
-generateSingletonBuildActions  11.3 s
-  parallel singleton batch      5.5 s   59 singletons concurrent; wall is bounded
-                                        by ONE long pole: testsuites 5.5 s
-                                        (next: tidy_phony_targets 2.8 s, all_teams 0.9 s)
-  soongonlyandroidmk (serial)   2.9 s
-  phony (serial)                2.4 s   folded; this is the residual false-positive (below)
-  other serial (aconfig,…)      0.5 s
-manifest write (WriteBuildFile) 5.8 s   O(tree): iterateAllVariants + sort + global
-                                        deduplicateOrderOnlyDeps (cross-module)
+singleton probe   4.3 s   132 throwaway singleton runs (one per singleton x
+                          {changed-set, empty-set}); serialised by soong's per-config
+                          Once lock, the same contention that caps the real singleton
+                          pass at ~5x parallelism
+manifest write    5.3 s   O(tree): iterateAllVariants + sort + global
+                          deduplicateOrderOnlyDeps (cross-module)
+bootstrap + misc  0.25 s
 ```
+
+### The contribution probe
+
+A whole-graph singleton's output is a per-module aggregation, so on a pure add
+`S(old ∪ added) = S(old)` iff the added modules contribute nothing to `S`. The probe
+decides that per singleton, soundly for additive singletons: run `S` twice in a
+throwaway context that commits nothing -- once over the genuinely-changed modules,
+once over the empty set -- and keep its resident build actions when the two
+emitted-output hashes match. Comparing against the **empty-set baseline** (not "did
+it emit anything") is what lets a singleton such as `testsuites`, which touches its
+internal maps for every module but only emits per test suite, be skipped on the add
+of a non-test module.
+
+Two subtleties made it work:
+- **Probe set = genuinely-changed modules**, keyed by a *tolerant* provider-value
+  hash. The non-tolerant hash that flags a module "changed" includes the Go funcs
+  carried by `Configurable`, so it differs run-to-run; a module like
+  `framework-minus-apex-install-dependencies` is a re-parse-hash false positive that
+  must drop out of the probe set, or it pins every singleton that reads it.
+- **Side-effect-free probe.** The soong `singletonAdaptor` runs the inner singleton
+  over the restricted set in a fresh `singletonContextAdaptor` whose buildParams/
+  dists/phonies are never committed, and against a throwaway `singletonInfo` so
+  `SetProvider` lands on a discard target.
+
+The probe is gated behind `membershipChanged` (warm resident add/remove only), so
+cold / non-resident / stock builds are byte-identical to upstream.
+
+Caveat: the probe is exact for **additive** singletons. A *relational* singleton --
+one whose per-module output depends on the presence of OTHER modules and is empty for
+the added module in isolation -- could in principle change while the probe sees
+nothing; none is known in the tree and the byte-gate polices it for every edit under
+test.
 
 The **phony singleton folds incrementally** (`android/phony.go`, `moduleContrib`
 per-module contribution cache + `keyOwners` inverted index, fed by new
@@ -126,42 +166,30 @@ The clean fix is a deterministic re-parse hash or a deep-equal false-positive gu
 in `DiffParsedModules` so an add is genuinely **pure**; the phony fold then collapses
 to ms.
 
-### Why sub-second add/remove is NOT yet reached, and what it needs
+The phony fold predates the probe and is now mostly subsumed by it (on the f/b add,
+phony is one of the 65 probe-skipped singletons); it remains as the incremental path
+for the rare singleton the probe can't skip.
 
-The remaining 17 s is **not** one bottleneck — it is three near-independent
-whole-tree phases, each needing its own incremental treatment:
+### Why sub-second add/remove is NOT yet reached, and what is left
 
-1. **`testsuites` 5.5 s + `soongonlyandroidmk` 2.9 s + the phony residual 2.4 s** —
-   whole-graph singletons that `VisitAllModules` and aggregate. Each re-runs in full
-   on a membership change. Folding each requires the same per-module-contribution
-   treatment the phony singleton got — a real, proven, but **per-singleton** effort
-   in Soong code (`android/`), one CL each.
-2. **`WriteBuildFile` 5.8 s** — `deduplicateOrderOnlyDeps` is a *global* operation
-   (it discovers order-only dep-sets shared *across* modules), so it is genuinely
-   O(tree) and not trivially incremental; the delta *shard* write is already O(edit).
+The singleton wall — the cost that made add/remove expensive — is gone: 65/66
+singletons skip and the 11.3 s of re-aggregation collapses to a 4.3 s probe + ~1 s.
+The remaining 9.8 s is two near-equal costs, each a further CL:
 
-Two generic shortcuts were investigated this session and rejected on soundness:
+1. **Probe overhead 4.3 s.** The probe is 132 throwaway singleton runs that serialise
+   on soong's per-config `Once` lock (the same contention that caps the *real*
+   singleton pass at ~5x parallelism — parallelising the probe loop alone did not
+   help). Two levers: cache the empty-set baseline across builds (halves the run
+   count) and reduce the `Once` contention (helps the real pass too).
+2. **Write 5.3 s.** `deduplicateOrderOnlyDeps` is a *global* operation (it discovers
+   order-only dep-sets shared *across* modules), genuinely O(tree); `iterateAllVariants`
+   + the sort are also O(tree). The delta *shard* write is already O(edit). On a no-op
+   add the dedup result is unchanged, so it is cacheable — but the write has several
+   O(tree) parts, so its floor after caching the dedup is still ~1–2 s.
 
-- **Provider-hash singleton restore** (cache a singleton keyed by the provider
-  value-hashes it read; restore if unchanged) is implemented but **inert**: in the
-  resident config `GetIncrementalEnabled()` is false, and more fundamentally most
-  Soong singletons read module *fields directly* (not via tracked `OtherModuleProvider`),
-  so their `depProviders` set is empty and they are never cacheable. Making it fire
-  would require migrating each singleton to declare its inputs as providers.
-- **Restricted-visit pure-add probe** (run each singleton with `VisitAll*` restricted
-  to only the added modules; if it emits nothing, the whole-graph output is unchanged
-  → restore the cached output). The aggregation argument is sound, but a probe run
-  cannot be cleanly isolated: `setSingletonProvider` writes to the real
-  `singletonInfo.providerInfo` and `DistForGoal`/etc. mutate global `Context` state,
-  so a throwaway probe pollutes real state. Not safely mergeable without intercepting
-  the full side-effect surface.
-
-So the honest path to sub-second add/remove is: (a) the pure-add diff guard (kills the
-phony residual, ~2.4 s), then (b) a per-singleton fold for `testsuites` and
-`soongonlyandroidmk` following the phony template (~8 s), then (c) an incremental or
-cached order-only dedup for the write (~5 s). Each is a discrete, byte-gated CL; none
-is a single-commit quick win, and several carry real divergence risk that the
-byte-gate must police.
+So sub-second needs: cache the order-only dedup (and the other O(tree) write passes)
+on an unchanged-contribution add, plus cut the probe's `Once` serialisation. Both are
+discrete, byte-gated follow-ups.
 
 ## Not done yet / honest caveats
 

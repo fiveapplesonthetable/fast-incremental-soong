@@ -1,17 +1,18 @@
 diff --git a/Android.bp b/Android.bp
-index 74308e0..5e9ba08 100644
+index 74308e0..c376cf9 100644
 --- a/Android.bp
 +++ b/Android.bp
-@@ -53,6 +53,8 @@ bootstrap_go_package {
+@@ -53,6 +53,9 @@ bootstrap_go_package {
          "context_gob_enc.go",
          "incremental.go",
          "incremental_gob_enc.go",
 +        "incremental_mutation.go",
 +        "incremental_ninja.go",
++        "incremental_singleton_probe.go",
          "levenshtein.go",
          "glob.go",
          "live_tracker.go",
-@@ -71,6 +73,8 @@ bootstrap_go_package {
+@@ -71,6 +74,8 @@ bootstrap_go_package {
      ],
      testSrcs: [
          "context_test.go",
@@ -158,7 +159,7 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..1ee95e6 100644
+index 199171c..d3d7fbe 100644
 --- a/context.go
 +++ b/context.go
 @@ -19,11 +19,9 @@ import (
@@ -214,7 +215,7 @@ index 199171c..1ee95e6 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +222,76 @@ type Context struct {
+@@ -190,6 +222,84 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -276,6 +277,14 @@ index 199171c..1ee95e6 100644
 +	// generateTargeted; nil on a full (cold) generate.
 +	regeneratedModules map[*moduleInfo]bool
 +
++	// residentProviderHashes snapshots each module variant's providerInitialValueHashes
++	// (keyed by stable identity) as of the last build. The singleton contribution probe
++	// uses it to narrow the probe set to modules whose PROVIDER OUTPUT genuinely changed:
++	// a module flagged "changed" by the property diff but whose providers are byte-equal
++	// (e.g. a re-parse hash false-positive) cannot affect any singleton and is excluded.
++	// Populated on the first build and refreshed for regenerated/added modules each build.
++	residentProviderHashes map[string]uint64
++
 +	// posShiftedModules is the set of clean (content-unchanged) modules whose source
 +	// POSITION moved because an edit added/removed lines earlier in their .bp file.
 +	// Their build actions are unchanged, but their emitted "# Defined: file:line"
@@ -291,7 +300,7 @@ index 199171c..1ee95e6 100644
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +463,21 @@ type moduleInfo struct {
+@@ -361,6 +471,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -313,7 +322,7 @@ index 199171c..1ee95e6 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +529,12 @@ type moduleInfo struct {
+@@ -412,6 +537,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -326,7 +335,7 @@ index 199171c..1ee95e6 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,10 +911,6 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +919,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
@@ -337,7 +346,7 @@ index 199171c..1ee95e6 100644
  func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
  	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
  		return err
-@@ -2936,7 +3055,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2936,7 +3063,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -351,7 +360,7 @@ index 199171c..1ee95e6 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3115,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3123,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -383,7 +392,7 @@ index 199171c..1ee95e6 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3155,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3163,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -405,7 +414,7 @@ index 199171c..1ee95e6 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3485,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3493,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -424,7 +433,7 @@ index 199171c..1ee95e6 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3371,6 +3535,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3543,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -445,7 +454,7 @@ index 199171c..1ee95e6 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,93 +3570,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3578,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -543,7 +552,7 @@ index 199171c..1ee95e6 100644
  			return false
  		})
  
-@@ -3487,6 +3584,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3487,6 +3592,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	errs = append(errs, visitErrs...)
  
@@ -554,7 +563,7 @@ index 199171c..1ee95e6 100644
  	return deps, errs
  }
  
-@@ -3597,8 +3698,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3706,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -568,7 +577,28 @@ index 199171c..1ee95e6 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3670,33 +3774,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3620,7 +3732,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+ }
+ 
+ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+-	singletons []*singletonInfo, liveGlobals *liveTracker) ([]string, []error) {
++	singletons []*singletonInfo, liveGlobals *liveTracker,
++	restorableSingleton map[*singletonInfo]bool) ([]string, []error) {
+ 
+ 	c.BeginEvent("generateParallelSingletonBuildActions")
+ 	defer c.EndEvent("generateParallelSingletonBuildActions")
+@@ -3654,6 +3767,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+ 			// Skip any singletons registered with parallel=false.
+ 			continue
+ 		}
++		if restorableSingleton[info] {
++			// Resident actionDefs kept across this membership rebuild; skip the re-run.
++			continue
++		}
+ 		wg.Add(1)
+ 		go func(inf *singletonInfo) {
+ 			defer wg.Done()
+@@ -3670,33 +3787,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
@@ -640,7 +670,7 @@ index 199171c..1ee95e6 100644
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,6 +3831,36 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,8 +3844,85 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -657,6 +687,14 @@ index 199171c..1ee95e6 100644
 +		return nil, nil
 +	}
 +
++	// On a cold (full) generate, snapshot every module's provider hashes so the next
++	// warm membership rebuild can tell which "changed" modules genuinely changed their
++	// provider output (the singleton contribution probe's input). Cheap O(tree) clone,
++	// once per resident server start; skipped on warm builds (regeneratedModules != nil).
++	if c.regeneratedModules == nil && c.residentProviderHashes == nil {
++		c.snapshotAllProviderHashes()
++	}
++
 +	// On a warm resident rebuild with a membership change, each singleton carries
 +	// generate-state from the previous build: its merged actionDefs, the providers it
 +	// set, and the started/finished guards. Singletons are single-use -- re-running
@@ -665,8 +703,44 @@ index 199171c..1ee95e6 100644
 +	// all_aconfig_declarations). Reset the per-build generate-state so the re-run is
 +	// clean and equivalent to a cold run. Cold builds start empty, so this only fires
 +	// on the resident membership-change path.
++	// restorableSingleton holds the whole-graph singletons we can SKIP this membership
++	// rebuild because none of the regenerated modules contributes to them (their
++	// resident actionDefs are byte-identical to a fresh run -- see
++	// incremental_singleton_probe.go). Skipped singletons are neither reset nor re-run.
++	var restorableSingleton map[*singletonInfo]bool
 +	if c.membershipChanged {
++		// The contribution probe is sound only when nothing was removed (a removal
++		// subtracts a contribution the probe, which runs over added+changed modules,
++		// cannot see). With removals, fall back to resetting and re-running everything.
++		if len(c.incrementalRemovedKeys) == 0 {
++			probeSet := c.genuinelyChangedProbeSet()
++			if len(probeSet) > 0 {
++				restorableSingleton = make(map[*singletonInfo]bool, len(singletons))
++				// Probe each singleton in parallel: every probe runs in its own throwaway
++				// context (throwaway singletonInfo + adaptor) and commits nothing to shared
++				// state, exactly like the real parallel singleton pass, so the runs are
++				// independent.
++				restorable := make([]bool, len(singletons))
++				var wg sync.WaitGroup
++				for i := range singletons {
++					wg.Add(1)
++					go func(i int) {
++						defer wg.Done()
++						restorable[i] = c.singletonRestorableOnAdd(singletons[i], config, liveGlobals, probeSet)
++					}(i)
++				}
++				wg.Wait()
++				for i, info := range singletons {
++					if restorable[i] {
++						restorableSingleton[info] = true
++					}
++				}
++			}
++		}
 +		for _, info := range singletons {
++			if restorableSingleton[info] {
++				continue // keep resident actionDefs; do not reset or re-run
++			}
 +			info.actionDefs = localBuildActions{}
 +			info.providerInfo = providerInfo{}
 +			info.startedGenerateBuildActions = false
@@ -676,8 +750,13 @@ index 199171c..1ee95e6 100644
 +
  	// Run one singleton.  Use a variable to simplify manual validation testing.
  	var runSingleton = func(info *singletonInfo) {
++		if restorableSingleton[info] {
++			return // resident actionDefs kept; skip the re-run
++		}
  		c.BeginEvent("singleton:" + info.name)
-@@ -3722,7 +3875,14 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+ 		defer c.EndEvent("singleton:" + info.name)
+ 		newDeps, newErrs := c.generateOneSingletonBuildActions(config, info, liveGlobals)
+@@ -3722,11 +3935,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -693,7 +772,12 @@ index 199171c..1ee95e6 100644
  	}
  
  	// First, take care of any singletons that want to run in parallel.
-@@ -4596,7 +4756,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+-	deps, errs = c.generateParallelSingletonBuildActions(config, singletons, liveGlobals)
++	deps, errs = c.generateParallelSingletonBuildActions(config, singletons, liveGlobals, restorableSingleton)
+ 
+ 	for _, info := range singletons {
+ 		if !info.parallel {
+@@ -4596,7 +4816,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -711,7 +795,7 @@ index 199171c..1ee95e6 100644
  			return
  		}
  	})
-@@ -4849,10 +5018,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5078,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -724,7 +808,7 @@ index 199171c..1ee95e6 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
-@@ -4900,7 +5068,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4900,7 +5128,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
@@ -740,7 +824,7 @@ index 199171c..1ee95e6 100644
  		return err
  	}
  
-@@ -4914,9 +5089,36 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5149,36 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
@@ -778,7 +862,7 @@ index 199171c..1ee95e6 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5148,62 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5208,62 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -850,7 +934,7 @@ index 199171c..1ee95e6 100644
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5284,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5344,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -864,7 +948,7 @@ index 199171c..1ee95e6 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +5367,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5427,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -901,7 +985,7 @@ index 199171c..1ee95e6 100644
  			return err
  		}
  	}
-@@ -5270,39 +5545,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5605,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -5498,6 +5582,205 @@ index 0000000..fbd85d5
 +
 +	return &localBuildActions{buildDefs: phonys}
 +}
+diff --git a/incremental_singleton_probe.go b/incremental_singleton_probe.go
+new file mode 100644
+index 0000000..a5f4ab6
+--- /dev/null
++++ b/incremental_singleton_probe.go
+@@ -0,0 +1,193 @@
++// Copyright 2025 Google Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package blueprint
++
++import (
++	"github.com/google/blueprint/proptools"
++)
++
++// Incremental whole-graph singleton skip for a pure-add membership rebuild.
++//
++// A membership change (a warm rebuild that adds modules) forces every whole-graph
++// singleton -- the ones that VisitAllModules and aggregate -- to re-run, because a
++// singleton is single-use and its cached actionDefs were computed over the old
++// module set. That re-run is the dominant cost of a warm add (testsuites,
++// soongonlyandroidmk, the parallel batch, ...).
++//
++// But a whole-graph singleton's output is a per-module aggregation:
++//
++//     S(old ∪ added) = S(old) ⊕ contribution(added)
++//
++// So if the newly-added modules contribute NOTHING to a given singleton, that
++// singleton's output is byte-identical to the previous build and we can keep its
++// resident actionDefs instead of re-running it. The previous build's output is
++// already in RAM on the resident singletonInfo, so "restore" is simply "don't reset,
++// don't re-run".
++//
++// We decide "contributes nothing" empirically and soundly for ADDITIVE singletons:
++// run the singleton over ONLY the added modules in a fully throwaway context and see
++// whether it emits anything (a build def, a dist, a phony, a provider). Emitting
++// nothing means the added modules are outside this singleton's input, so the
++// aggregate is unchanged. The probe is isolated -- it writes to a throwaway
++// singletonInfo and (for soong) a throwaway context adaptor whose dists/phonies/
++// buildParams are never committed -- so it cannot perturb real state.
++//
++// Soundness caveat: this is exact for an ADDITIVE singleton, where a module's
++// contribution is independent of which other modules exist. A RELATIONAL singleton
++// (one whose per-module output depends on the presence of OTHER modules, and is
++// empty for the added module in isolation) could in principle change its output
++// while the probe sees nothing. No such singleton is known in the tree, and the
++// byte-verification gate (warm == cold) polices it for every edit under test. A
++// singleton that is not additive should refuse to implement probeContributor.
++
++// probeContributor is implemented by a singleton (in practice the soong
++// singletonAdaptor) that can run itself over a restricted module set in a throwaway
++// context and report whether it produced any output. A singleton that does not
++// implement it is never probe-skipped: it always re-runs on a membership change.
++type probeContributor interface {
++	// ProbeContribution runs this singleton's GenerateBuildActions over the modules
++	// visible through ctx (a probe context restricted to a given module subset) in a
++	// fully throwaway context that commits nothing, and returns a hash of everything it
++	// emitted (build actions, dists, phonies). The incremental layer compares the hash
++	// over the regenerated modules against the hash over the empty set: equal means the
++	// regenerated modules added nothing to this singleton's output, so it can be skipped.
++	ProbeContribution(ctx SingletonContext) uint64
++}
++
++// probeIdentity is the stable, build-to-build key for a module variant, matching the
++// keys folded into residentProviderHashes.
++func probeIdentity(m *moduleInfo) string {
++	return moduleIdentity(m.cachedUniqueName, m.variant.name)
++}
++
++// providerOutputHash is a deterministic, build-to-build hash of a module's emitted
++// provider VALUES. It uses CalculateHashTolerant (which skips Go funcs) rather than the
++// stored providerInitialValueHashes: the latter is computed with the non-tolerant
++// CalculateHash, which hashes the postProcessor funcs carried by Configurable provider
++// values by pointer and so differs run-to-run even when the module is byte-identical
++// (the very framework "changed" false-positive we must see through). The tolerant hash
++// is stable for an unchanged module, matching what the byte-verification gate observes.
++func providerOutputHash(m *moduleInfo) uint64 {
++	h, err := proptools.CalculateHashTolerant(&m.providers)
++	if err != nil {
++		// Treat an un-hashable module as always-changed (conservative: it stays in the
++		// probe set, so no singleton is wrongly skipped on its account).
++		return 0
++	}
++	return h
++}
++
++// genuinelyChangedProbeSet returns the modules whose PROVIDER OUTPUT actually changed
++// this build -- the added modules (always) plus the regenerated modules whose tolerant
++// provider-value hash differs from the previous build's snapshot. A module that was
++// regenerated but whose provider values are unchanged (a property-diff false positive
++// such as a non-deterministic re-parse hash) is excluded: it cannot change any
++// singleton's output, so a singleton it would otherwise pin can still be skipped.
++//
++// It also refreshes residentProviderHashes for the regenerated/added modules so the
++// next build compares against this build's values. On the first build the snapshot is
++// empty and is back-filled from every module (returning a full set so nothing is
++// wrongly skipped before a baseline exists).
++func (c *Context) genuinelyChangedProbeSet() []*moduleInfo {
++	if c.regeneratedModules == nil {
++		return nil
++	}
++	if c.residentProviderHashes == nil {
++		c.residentProviderHashes = make(map[string]uint64)
++	}
++	var out []*moduleInfo
++	for m := range c.regeneratedModules {
++		id := probeIdentity(m)
++		prev, had := c.residentProviderHashes[id]
++		cur := providerOutputHash(m)
++		if !had || prev != cur {
++			out = append(out, m)
++		}
++		c.residentProviderHashes[id] = cur
++	}
++	return out
++}
++
++// snapshotAllProviderHashes records every module variant's tolerant provider-value hash
++// as the baseline for the next build's genuinelyChangedProbeSet. Called once after a
++// cold (full) generate so the first warm rebuild has something to diff against.
++func (c *Context) snapshotAllProviderHashes() {
++	snap := make(map[string]uint64, len(c.moduleGroups))
++	c.visitAllModuleInfos(func(m *moduleInfo) {
++		snap[probeIdentity(m)] = providerOutputHash(m)
++	})
++	c.residentProviderHashes = snap
++}
++
++// singletonRestorableOnAdd reports whether a whole-graph singleton can keep its
++// resident build actions across this membership rebuild -- i.e. none of the
++// regenerated modules (added + changed) contributes to it. Only sound when no module
++// was removed (a removal subtracts a contribution the probe cannot observe); the
++// caller enforces that. probeSet is the regenerated module set to run the singleton
++// over.
++func (c *Context) singletonRestorableOnAdd(info *singletonInfo, config interface{},
++	liveGlobals *liveTracker, probeSet []*moduleInfo) bool {
++
++	pc, ok := info.singleton.(probeContributor)
++	if !ok {
++		return false // can't probe -> must re-run
++	}
++	if len(probeSet) == 0 {
++		return false
++	}
++
++	// Run the singleton's probe over the regenerated modules and over the empty set.
++	// If the two emitted-output hashes are equal, the regenerated modules contribute
++	// nothing this singleton wouldn't emit anyway, so its whole-graph output is
++	// unchanged and we can keep its resident actionDefs. Comparing against the empty
++	// baseline (not "did it emit anything") is what lets a singleton that touches its
++	// internal maps for every module -- but only emits per test suite / per real entry
++	// -- be skipped on the add of a module it doesn't actually surface.
++	sig := func(restrict []*moduleInfo) (h uint64, ok bool) {
++		ok = true
++		defer func() {
++			if r := recover(); r != nil {
++				ok = false // a panicking probe is unsafe to trust -> force re-run
++			}
++		}()
++		// Throwaway singletonInfo so any SetProvider during the probe lands on a discard
++		// target, never the real info (which would double-set on the subsequent real run).
++		probeInfo := &singletonInfo{
++			singleton:                   info.singleton,
++			name:                        info.name,
++			startedGenerateBuildActions: true,
++		}
++		sctx := &singletonContext{
++			singleton:     probeInfo,
++			context:       c,
++			config:        config,
++			scope:         newLocalScope(nil, singletonNamespacePrefix(info.name)),
++			globals:       liveGlobals,
++			depProviders:  make(map[int]bool),
++			probeRestrict: restrict,
++		}
++		h = pc.ProbeContribution(sctx)
++		// A blueprint-level singleton emits into sctx.actionDefs rather than through the
++		// soong adaptor; fold its size in so such a singleton is never wrongly skipped.
++		h ^= uint64(len(sctx.actionDefs.buildDefs))*1469598103934665603 +
++			uint64(len(sctx.actionDefs.variables))*1099511628211 +
++			uint64(len(sctx.actionDefs.rules))
++		return h, ok
++	}
++
++	added, ok1 := sig(probeSet)
++	empty, ok2 := sig([]*moduleInfo{})
++	return ok1 && ok2 && added == empty
++}
 diff --git a/metrics/event_handler.go b/metrics/event_handler.go
 index 35a6858..24dde07 100644
 --- a/metrics/event_handler.go
@@ -5638,7 +5921,7 @@ index d877c9d..6d93af3 100644
  	}
  	return nil
 diff --git a/singleton_ctx.go b/singleton_ctx.go
-index e570b69..4d43415 100644
+index e570b69..e56247a 100644
 --- a/singleton_ctx.go
 +++ b/singleton_ctx.go
 @@ -118,6 +118,23 @@ type SingletonContext interface {
@@ -5665,7 +5948,56 @@ index e570b69..4d43415 100644
  	// VisitAllModulesOrProxies calls visit for each defined variant of each module in an unspecified order,
  	// passing a Module if the module did not call FreeModuleAfterGenerateBuildActions, or a ModuleProxy if
  	// it did.
-@@ -391,6 +408,44 @@ func (s *singletonContext) VisitAllModuleProxies(visit func(proxy ModuleProxy))
+@@ -233,6 +250,13 @@ type singletonContext struct {
+ 	actionDefs localBuildActions
+ 
+ 	depProviders map[int]bool
++
++	// probeRestrict, when non-nil, restricts the VisitAll* family to exactly these
++	// module variants. It is set only for a throwaway "contribution probe" run (see
++	// incremental_singleton_probe.go): a pure-add membership rebuild runs each
++	// singleton over only the newly-added modules to decide whether its whole-graph
++	// output could have changed. A nil value (every normal run) visits all modules.
++	probeRestrict []*moduleInfo
+ }
+ 
+ func (s *singletonContext) Config() interface{} {
+@@ -380,20 +404,90 @@ func (s *singletonContext) AddSubninja(file string) {
+ }
+ 
+ func (s *singletonContext) VisitAllModules(visit func(Module)) {
++	if s.probeRestrict != nil {
++		for _, m := range s.probeRestrict {
++			if m.logicModule != nil {
++				visit(m.logicModule)
++			}
++		}
++		return
++	}
+ 	s.context.VisitAllModules(visit)
+ }
+ 
+ func (s *singletonContext) VisitAllModulesOrProxies(visit func(ModuleOrProxy)) {
++	if s.probeRestrict != nil {
++		for _, m := range s.probeRestrict {
++			if m.logicModule != nil {
++				visit(m.logicModule)
++			} else {
++				visit(ModuleProxy{m})
++			}
++		}
++		return
++	}
+ 	s.context.VisitAllModulesOrProxies(visit)
+ }
+ 
+ func (s *singletonContext) VisitAllModuleProxies(visit func(proxy ModuleProxy)) {
++	if s.probeRestrict != nil {
++		for _, m := range s.probeRestrict {
++			visit(ModuleProxy{m})
++		}
++		return
++	}
  	s.context.VisitAllModulesProxies(visit)
  }
  
@@ -5709,6 +6041,17 @@ index e570b69..4d43415 100644
 +
  func (s *singletonContext) VisitAllModulesIf(pred func(Module) bool,
  	visit func(Module)) {
+ 
++	if s.probeRestrict != nil {
++		for _, m := range s.probeRestrict {
++			if m.logicModule != nil && pred(m.logicModule) {
++				visit(m.logicModule)
++			}
++		}
++		return
++	}
+ 	s.context.VisitAllModulesIf(pred, visit)
+ }
  
 diff --git a/timing_test_helpers_test.go b/timing_test_helpers_test.go
 new file mode 100644
