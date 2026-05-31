@@ -174,22 +174,40 @@ for the rare singleton the probe can't skip.
 
 The singleton wall — the cost that made add/remove expensive — is gone: 65/66
 singletons skip and the 11.3 s of re-aggregation collapses to a 4.3 s probe + ~1 s.
-The remaining 9.8 s is two near-equal costs, each a further CL:
+With the write then made O(edit) (below), the f/b add is **~8.5 s** byte-identical,
+two near-equal costs left, each a further CL:
 
-1. **Probe overhead 4.3 s.** The probe is 132 throwaway singleton runs that serialise
+1. **Probe overhead ~4.3 s.** The probe is 132 throwaway singleton runs that serialise
    on soong's per-config `Once` lock (the same contention that caps the *real*
    singleton pass at ~5x parallelism — parallelising the probe loop alone did not
    help). Two levers: cache the empty-set baseline across builds (halves the run
    count) and reduce the `Once` contention (helps the real pass too).
-2. **Write 5.3 s.** `deduplicateOrderOnlyDeps` is a *global* operation (it discovers
-   order-only dep-sets shared *across* modules), genuinely O(tree); `iterateAllVariants`
-   + the sort are also O(tree). The delta *shard* write is already O(edit). On a no-op
-   add the dedup result is unchanged, so it is cacheable — but the write has several
-   O(tree) parts, so its floor after caching the dedup is still ~1–2 s.
+2. **Write ~3.5 s.** The shard write is now O(edit) (below); what remains is the
+   global `deduplicateOrderOnlyDeps` (~1.1 s, cacheable on a no-op add) and the
+   single O(tree) `shardModulesStable` assignment pass (~1 s, cacheable across builds).
 
-So sub-second needs: cache the order-only dedup (and the other O(tree) write passes)
-on an unchanged-contribution add, plus cut the probe's `Once` serialisation. Both are
-discrete, byte-gated follow-ups.
+### The write made O(edit)
+
+The delta write was already shard-skipping (only shards holding a changed module are
+rewritten), but three things kept it O(tree) on an add. All now fixed, byte-identical:
+
+- **Shard-dirtiness keys off the genuinely-changed set** (provider output actually
+  changed, from the probe) rather than the full regenerated set, so the
+  re-parse-hash false positive `framework-minus-apex` no longer forces its large
+  shard to be rewritten.
+- **Dirty shard indices come from that bounded changed set** (`dirtyShardSet`) instead
+  of scanning every module's shard; `stableShardIndex` uses an inline allocation-free
+  FNV-1a, so the 2x100k per-module shard assignment stops allocating a hasher per call.
+- **The singletons subninja** (~40 % of the manifest) is hashed and left untouched when
+  unchanged — the common case once the probe has kept all but a few singletons.
+
+Plus **finer sharding** (`SOONG_NINJA_SHARDS=500`): a module's shard is now ~210
+modules instead of ~2 100, so rewriting the one shard a 1-module add dirties costs
+~10x less. Net: regenerate+write 9.8 s → ~8.5 s, 467/467 shards byte-identical.
+
+So sub-second needs: cache the order-only dedup and the shard assignment on an
+unchanged-contribution add, plus cut the probe's `Once` serialisation. Discrete,
+byte-gated follow-ups.
 
 ## Not done yet / honest caveats
 

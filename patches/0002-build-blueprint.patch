@@ -159,7 +159,7 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..d3d7fbe 100644
+index 199171c..7b2a2a0 100644
 --- a/context.go
 +++ b/context.go
 @@ -19,11 +19,9 @@ import (
@@ -215,7 +215,7 @@ index 199171c..d3d7fbe 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +222,84 @@ type Context struct {
+@@ -190,6 +222,98 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -285,6 +285,14 @@ index 199171c..d3d7fbe 100644
 +	// Populated on the first build and refreshed for regenerated/added modules each build.
 +	residentProviderHashes map[string]uint64
 +
++	// genuinelyChangedModules is the subset of regeneratedModules whose PROVIDER output
++	// actually changed this build (plus the added modules), computed by the singleton
++	// contribution probe. The delta write keys shard-dirtiness off this instead of the
++	// full regeneratedModules set, so a module flagged "regenerated" by a re-parse-hash
++	// false positive (e.g. framework-minus-apex) -- whose emitted ninja is byte-identical
++	// -- does not force its (large) shard to be rewritten. nil outside a probed warm add.
++	genuinelyChangedModules map[*moduleInfo]bool
++
 +	// posShiftedModules is the set of clean (content-unchanged) modules whose source
 +	// POSITION moved because an edit added/removed lines earlier in their .bp file.
 +	// Their build actions are unchanged, but their emitted "# Defined: file:line"
@@ -297,10 +305,16 @@ index 199171c..d3d7fbe 100644
 +	// when the deduplicated phony set is unchanged. Zero on a fresh Context.
 +	phonysHash uint64
 +
++	// singletonsHash is the hash of the singletons subninja content from the last
++	// build, used to skip rewriting that (large, ~40% of the manifest) file on a
++	// resident rebuild when the singletons' combined output is unchanged -- which it
++	// usually is once the contribution probe has kept all but a few singletons.
++	singletonsHash uint64
++
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +471,21 @@ type moduleInfo struct {
+@@ -361,6 +485,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -322,7 +336,7 @@ index 199171c..d3d7fbe 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +537,12 @@ type moduleInfo struct {
+@@ -412,6 +551,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -335,7 +349,7 @@ index 199171c..d3d7fbe 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,10 +919,6 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +933,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
@@ -346,7 +360,7 @@ index 199171c..d3d7fbe 100644
  func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
  	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
  		return err
-@@ -2936,7 +3063,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2936,7 +3077,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -360,7 +374,7 @@ index 199171c..d3d7fbe 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3123,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3137,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -392,7 +406,7 @@ index 199171c..d3d7fbe 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3163,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3177,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -414,7 +428,7 @@ index 199171c..d3d7fbe 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3493,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3507,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -433,7 +447,7 @@ index 199171c..d3d7fbe 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3371,6 +3543,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3557,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -454,7 +468,7 @@ index 199171c..d3d7fbe 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,93 +3578,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3592,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -552,7 +566,7 @@ index 199171c..d3d7fbe 100644
  			return false
  		})
  
-@@ -3487,6 +3592,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3487,6 +3606,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	errs = append(errs, visitErrs...)
  
@@ -563,7 +577,7 @@ index 199171c..d3d7fbe 100644
  	return deps, errs
  }
  
-@@ -3597,8 +3706,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3720,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -577,7 +591,7 @@ index 199171c..d3d7fbe 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3620,7 +3732,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3620,7 +3746,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  }
  
  func (c *Context) generateParallelSingletonBuildActions(config interface{},
@@ -587,7 +601,7 @@ index 199171c..d3d7fbe 100644
  
  	c.BeginEvent("generateParallelSingletonBuildActions")
  	defer c.EndEvent("generateParallelSingletonBuildActions")
-@@ -3654,6 +3767,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3654,6 +3781,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  			// Skip any singletons registered with parallel=false.
  			continue
  		}
@@ -598,7 +612,7 @@ index 199171c..d3d7fbe 100644
  		wg.Add(1)
  		go func(inf *singletonInfo) {
  			defer wg.Done()
-@@ -3670,33 +3787,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3670,33 +3801,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
@@ -670,7 +684,7 @@ index 199171c..d3d7fbe 100644
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,8 +3844,85 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,8 +3858,85 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -756,7 +770,7 @@ index 199171c..d3d7fbe 100644
  		c.BeginEvent("singleton:" + info.name)
  		defer c.EndEvent("singleton:" + info.name)
  		newDeps, newErrs := c.generateOneSingletonBuildActions(config, info, liveGlobals)
-@@ -3722,11 +3935,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3722,11 +3949,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -777,7 +791,7 @@ index 199171c..d3d7fbe 100644
  
  	for _, info := range singletons {
  		if !info.parallel {
-@@ -4596,7 +4816,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+@@ -4596,7 +4830,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -795,7 +809,7 @@ index 199171c..d3d7fbe 100644
  			return
  		}
  	})
-@@ -4849,10 +5078,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5092,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -808,7 +822,7 @@ index 199171c..d3d7fbe 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
-@@ -4900,7 +5128,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4900,7 +5142,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
@@ -824,7 +838,7 @@ index 199171c..d3d7fbe 100644
  		return err
  	}
  
-@@ -4914,9 +5149,36 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5163,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
@@ -849,10 +863,14 @@ index 199171c..d3d7fbe 100644
 +		// removed module's shard marked dirty; removals currently fall back to a full
 +		// rebuild before reaching here.)
 +		deltaWrite := c.dirtyModules != nil
++		var dirtyShards map[int]bool
++		if deltaWrite {
++			dirtyShards = c.dirtyShardSet(len(files), false)
++		}
 +		skippedShards := 0
  		for i, batchModules := range shardedModules {
  			file := files[i]
-+			if deltaWrite && !c.shardHasDirtyModule(batchModules) && !c.forcedDirtyShards[i] {
++			if deltaWrite && !dirtyShards[i] && !c.forcedDirtyShards[i] {
 +				// Leave the existing on-disk shard untouched; still reference it so the
 +				// top-level manifest's subninja set is complete.
 +				nw.Subninja(file)
@@ -862,7 +880,7 @@ index 199171c..d3d7fbe 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5208,62 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5226,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -910,11 +928,15 @@ index 199171c..d3d7fbe 100644
 -		}()
 -		nw.Subninja(file)
 +			incShards := shardModulesStable(incModules, len(incFiles))
++			var incDirtyShards map[int]bool
++			if deltaWrite {
++				incDirtyShards = c.dirtyShardSet(len(incFiles), true)
++			}
 +			incSkipped := 0
 +			for i, batch := range incShards {
 +				incFile := incFiles[i]
 +				nw.Subninja(incFile)
-+				if deltaWrite && !c.shardHasDirtyModule(batch) && !c.forcedDirtyShards[i] {
++				if deltaWrite && !incDirtyShards[i] && !c.forcedDirtyShards[i] {
 +					incSkipped++
 +					continue
 +				}
@@ -934,7 +956,7 @@ index 199171c..d3d7fbe 100644
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5344,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5366,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -948,7 +970,7 @@ index 199171c..d3d7fbe 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +5427,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5449,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -985,7 +1007,7 @@ index 199171c..d3d7fbe 100644
  			return err
  		}
  	}
-@@ -5270,39 +5605,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5627,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -1063,10 +1085,10 @@ index ad27b1f..13d31aa 100644
  		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 diff --git a/incremental_mutation.go b/incremental_mutation.go
 new file mode 100644
-index 0000000..6e372ce
+index 0000000..67361e2
 --- /dev/null
 +++ b/incremental_mutation.go
-@@ -0,0 +1,1902 @@
+@@ -0,0 +1,1903 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -2093,6 +2115,7 @@ index 0000000..6e372ce
 +	c.forceNinjaWrite = false
 +	c.membershipChanged = false
 +	c.regeneratedModules = nil
++	c.genuinelyChangedModules = nil
 +	c.posShiftedModules = map[*moduleInfo]bool{}
 +	c.forcedDirtyShards = nil
 +	c.orderOnlyDirtyModules = nil
@@ -4619,10 +4642,10 @@ index 0000000..71a60b0
 +}
 diff --git a/incremental_ninja.go b/incremental_ninja.go
 new file mode 100644
-index 0000000..fbd85d5
+index 0000000..31b31f0
 --- /dev/null
 +++ b/incremental_ninja.go
-@@ -0,0 +1,959 @@
+@@ -0,0 +1,1027 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5285,17 +5308,34 @@ index 0000000..fbd85d5
 +		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja\n")
 +		return nil
 +	}
++	// Singletons were regenerated (a membership change re-runs/probes them), but most
++	// emit byte-identical output -- the contribution probe keeps all but the few a
++	// change actually surfaces. Serialize into memory and hash; if it matches the
++	// previous build's singletons subninja (and this is a targeted rebuild), the
++	// on-disk file is byte-exact, so skip rewriting this large (~40% of manifest) file.
++	var bb bytes.Buffer
++	if err := c.writeAllSingletonActions(newNinjaWriter(&bb)); err != nil {
++		return err
++	}
++	hasher := fnv.New64a()
++	hasher.Write(bb.Bytes())
++	sum := hasher.Sum64()
++	if c.dirtyModules != nil && sum == c.singletonsHash {
++		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja (hash)\n")
++		return nil
++	}
++	c.singletonsHash = sum
++
 +	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
 +	if err != nil {
 +		return fmt.Errorf("error opening singletons Ninja file: %s", err)
 +	}
 +	defer f.Close()
-+	buf := bufio.NewWriterSize(f, 16*1024*1024)
-+	sw := newNinjaWriter(buf)
-+	if err := c.writeAllSingletonActions(sw); err != nil {
++	out := bufio.NewWriterSize(f, 16*1024*1024)
++	if _, err := out.Write(bb.Bytes()); err != nil {
 +		return err
 +	}
-+	return buf.Flush()
++	return out.Flush()
 +}
 +
 +// PhonysNinjaFile returns the path of the subninja holding the deduplicated
@@ -5379,6 +5419,13 @@ index 0000000..fbd85d5
 +	if c.orderOnlyDirtyModules[m] {
 +		return true // a shared order-only key crossed the dedup threshold -> text changed
 +	}
++	if c.genuinelyChangedModules != nil {
++		// Probed warm add: a regenerated module whose emitted output didn't genuinely
++		// change (provider output byte-equal -- a re-parse-hash false positive such as
++		// framework-minus-apex) has byte-identical on-disk ninja, so its shard need not
++		// be rewritten. Only genuinely-changed and added modules dirty their shard.
++		return c.genuinelyChangedModules[m]
++	}
 +	if c.regeneratedModules != nil {
 +		return c.regeneratedModules[m]
 +	}
@@ -5414,11 +5461,55 @@ index 0000000..fbd85d5
 +	if n <= 0 {
 +		return 0
 +	}
-+	h := fnv.New64a()
-+	h.Write([]byte(cachedUniqueName))
-+	h.Write([]byte{0})
-+	h.Write([]byte(variantName))
-+	return int(h.Sum64() % uint64(n))
++	// Inline FNV-1a (identical bytes to fnv.New64a over cachedUniqueName+NUL+variant)
++	// but without allocating a hasher per call -- this runs once per module variant
++	// (2 x ~100k at AOSP scale), so the per-call allocation dominated the shard write.
++	const offset64 = 14695981039346656037
++	const prime64 = 1099511628211
++	h := uint64(offset64)
++	for i := 0; i < len(cachedUniqueName); i++ {
++		h = (h ^ uint64(cachedUniqueName[i])) * prime64
++	}
++	h = (h ^ 0) * prime64
++	for i := 0; i < len(variantName); i++ {
++		h = (h ^ uint64(variantName[i])) * prime64
++	}
++	return int(h % uint64(n))
++}
++
++// dirtyShardSet returns the shard indices that hold a regenerated module, computed
++// from the bounded changed set (added + genuinely-changed + position/order-only
++// affected) rather than by scanning every module's shard (shardHasDirtyModule over
++// the whole tree). O(edit), not O(tree). inc selects the incremental-module shards
++// (incrementalSupported) vs the regular ones, matching the two shard passes.
++func (c *Context) dirtyShardSet(n int, inc bool) map[int]bool {
++	dirty := make(map[int]bool)
++	mark := func(m *moduleInfo) {
++		if m.incrementalSupported == inc {
++			dirty[stableShardIndex(m.cachedUniqueName, m.variant.name, n)] = true
++		}
++	}
++	switch {
++	case c.genuinelyChangedModules != nil:
++		for m := range c.genuinelyChangedModules {
++			mark(m)
++		}
++	case c.regeneratedModules != nil:
++		for m := range c.regeneratedModules {
++			mark(m)
++		}
++	default:
++		for m := range c.dirtyModules {
++			mark(m)
++		}
++	}
++	for m := range c.posShiftedModules {
++		mark(m)
++	}
++	for m := range c.orderOnlyDirtyModules {
++		mark(m)
++	}
++	return dirty
 +}
 +
 +func shardModulesStable(modules []*moduleInfo, n int) [][]*moduleInfo {
@@ -5584,10 +5675,10 @@ index 0000000..fbd85d5
 +}
 diff --git a/incremental_singleton_probe.go b/incremental_singleton_probe.go
 new file mode 100644
-index 0000000..a5f4ab6
+index 0000000..b722c51
 --- /dev/null
 +++ b/incremental_singleton_probe.go
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,195 @@
 +// Copyright 2025 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5698,12 +5789,14 @@ index 0000000..a5f4ab6
 +		c.residentProviderHashes = make(map[string]uint64)
 +	}
 +	var out []*moduleInfo
++	c.genuinelyChangedModules = make(map[*moduleInfo]bool)
 +	for m := range c.regeneratedModules {
 +		id := probeIdentity(m)
 +		prev, had := c.residentProviderHashes[id]
 +		cur := providerOutputHash(m)
 +		if !had || prev != cur {
 +			out = append(out, m)
++			c.genuinelyChangedModules[m] = true
 +		}
 +		c.residentProviderHashes[id] = cur
 +	}
