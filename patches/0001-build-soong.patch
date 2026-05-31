@@ -1,4 +1,4 @@
-From da7a5215320c429649252704079bb06e907109b5 Mon Sep 17 00:00:00 2001
+From 5a83c66766b2d62f86fe9aa99c43c94b006e7213 Mon Sep 17 00:00:00 2001
 From: Zimuzo Ezeozue <zezeozue@google.com>
 Date: Sat, 30 May 2026 14:40:16 +0000
 Subject: [PATCH] =?UTF-8?q?soong:=20resident=20warm-incremental=20build=20?=
@@ -27,8 +27,8 @@ IncrementalAddModules/Remove with fallback. Local/experimental.
 Change-Id: Id5fffb376513e3028b76af007f85b687bd351126
 ---
  android/namespace.go               |  13 +
- android/phony.go                   | 219 +++++++++++------
- android/singleton.go               |  10 +
+ android/phony.go                   | 370 ++++++++++++++++++++++------
+ android/singleton.go               |  30 +++
  android/singleton_module.go        |  11 +
  cmd/soong_build/Android.bp         |   1 +
  cmd/soong_build/main.go            | 250 ++++++++++++++++++-
@@ -39,7 +39,7 @@ Change-Id: Id5fffb376513e3028b76af007f85b687bd351126
  ui/build/ninja.go                  |  10 +
  ui/build/ninja_resident.go         | 120 +++++++++
  ui/build/soong.go                  |  41 ++++
- 13 files changed, 1651 insertions(+), 83 deletions(-)
+ 13 files changed, 1819 insertions(+), 86 deletions(-)
  create mode 100644 cmd/soong_build/persistent.go
  create mode 100644 docs/incremental_soong_tutorial.md
  create mode 100644 docs/resident_incremental_build.md
@@ -70,7 +70,7 @@ index 7d2ace2ca..17dcf9252 100644
  	r.rootNamespace.moduleContainer.NewSkippedModule(ctx, name, skipInfo)
  }
 diff --git a/android/phony.go b/android/phony.go
-index 105477a05..8aab5829d 100644
+index 105477a05..2e152a003 100644
 --- a/android/phony.go
 +++ b/android/phony.go
 @@ -16,6 +16,7 @@ package android
@@ -81,15 +81,25 @@ index 105477a05..8aab5829d 100644
  	"runtime"
  	"sort"
  	"strings"
-@@ -42,106 +43,184 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
+@@ -42,106 +43,329 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
  type phonySingleton struct {
  	phonyMap  phonyMap
  	phonyList []string
 +	// singletonPhonyMap is the previous build's phony contributions from OTHER
-+	// singletons (SingletonPhonyProvider), kept so the resident pure-add fold can tell
-+	// whether they changed. Singletons aggregate over the whole module set, so adding a
-+	// module can change them; if they changed the fold is unsafe and we rebuild fully.
++	// singletons (SingletonPhonyProvider), kept so the resident fold can detect which
++	// singleton-emitted phony keys changed and re-derive only those.
 +	singletonPhonyMap phonyMap
++	// moduleContrib is each module's own phony contribution (raw, unsorted), keyed by
++	// the module's stable identity (SingletonContext.IncrementalModuleKey). It lets a
++	// warm membership change re-derive only the phony keys touched by the regenerated
++	// or removed modules -- subtracting a changed module's old contribution and adding
++	// its new one -- instead of re-reading all ~14k modules. Persists in the resident
++	// daemon across builds.
++	moduleContrib map[string]phonyMap
++	// keyOwners is the inverted index of moduleContrib: phony key -> set of module
++	// keys that contribute to it. It lets the fold re-derive a touched key from only
++	// its actual (few) contributors instead of scanning all ~14k modules per key.
++	keyOwners map[string]map[string]bool
  }
  
  var _ SingletonMakeVarsProvider = (*phonySingleton)(nil)
@@ -100,6 +110,7 @@ index 105477a05..8aab5829d 100644
 -		if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
 -			for k, v := range info.Phonies {
 -				p.phonyMap[k] = append(p.phonyMap[k], v...)
+-			}
 +// phonyMkShards is the number of files the soong-only phony makefile is sharded
 +// into (soong_phony_targets.N.mk). A stable hash of each phony key picks its shard,
 +// so a warm add rewrites only the shards whose keys changed instead of the whole
@@ -121,26 +132,34 @@ index 105477a05..8aab5829d 100644
 +	}
 +	for k, av := range a {
 +		bv, ok := b[k]
-+		if !ok || len(av) != len(bv) {
++		if !ok || !samePaths(av, bv) {
 +			return false
-+		}
-+		for i := range av {
-+			if av[i].String() != bv[i].String() {
-+				return false
- 			}
  		}
 -	})
 +	}
 +	return true
 +}
- 
++
++// samePaths reports whether two Paths are equal (order-sensitive, by String).
++func samePaths(a, b Paths) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i].String() != b[i].String() {
++			return false
++		}
++	}
++	return true
++}
++
 +func (p *phonySingleton) GenerateBuildActions(ctx SingletonContext) {
 +	// touchedShards is the set of output .mk shards whose content changed this build.
 +	// On a pure add only the shards holding a newly-added module's phony keys change,
 +	// so only those are rebuilt and rewritten; the rest are kept on disk. On a full
 +	// build every shard is (re)written.
 +	touchedShards := map[int]bool{}
-+
+ 
 +	// Singletons are few, so always recompute their phony contributions fresh. This is
 +	// what makes the pure-add fold below correct across a membership change: a singleton
 +	// that aggregates over all modules (all_teams, sbom, owners, test_mapping, ...) can
@@ -156,36 +175,117 @@ index 105477a05..8aab5829d 100644
  			}
  		}
  	})
-+	singletonChanged := !samePhonyMap(singletonPhonies, p.singletonPhonyMap)
-+	p.singletonPhonyMap = singletonPhonies
-+
-+	if ctx.IncrementalPureAdd() && p.phonyMap != nil && !singletonChanged {
-+		// Fold: keep the cached, already-sorted phonyMap from the previous build (whose
-+		// singleton phonies we just confirmed unchanged) and merge in only the modules
-+		// added this build, re-sorting only the keys they touch. Avoids re-reading all
-+		// ~14k modules' providers and re-sorting all keys.
-+		ctx.VisitAddedModuleProxies(func(m ModuleProxy) {
-+			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
-+				for k, v := range info.Phonies {
-+					p.phonyMap[k] = SortedUniquePaths(append(p.phonyMap[k], v...))
-+					touchedShards[phonyMkShardOf(k)] = true
-+				}
++	if ctx.IncrementalMembershipFold() && p.phonyMap != nil && p.moduleContrib != nil {
++		// INCREMENTAL FOLD across a membership change: patch only the phony keys touched
++		// by the regenerated/removed modules and by changed singleton phonies, re-deriving
++		// each touched key from ONLY its contributors (via the keyOwners inverted index),
++		// not the whole tree -> O(edit). Every untouched key keeps its cached value.
++		touchedKeys := map[string]bool{}
++		addOwner := func(k, mk string) {
++			owners := p.keyOwners[k]
++			if owners == nil {
++				owners = map[string]bool{}
++				p.keyOwners[k] = owners
 +			}
-+		})
-+		p.phonyList = make([]string, 0, len(p.phonyMap))
-+		for phony := range p.phonyMap {
-+			p.phonyList = append(p.phonyList, phony)
++			owners[mk] = true
++			touchedKeys[k] = true
 +		}
-+		sort.Strings(p.phonyList)
-+	} else {
-+		p.phonyMap = make(phonyMap)
-+		ctx.VisitAllModuleProxies(func(m ModuleProxy) {
-+			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok {
-+				for k, v := range info.Phonies {
-+					p.phonyMap[k] = append(p.phonyMap[k], v...)
++		removeOwner := func(k, mk string) {
++			if owners := p.keyOwners[k]; owners != nil {
++				delete(owners, mk)
++				if len(owners) == 0 {
++					delete(p.keyOwners, k)
 +				}
 +			}
-+		})
++			touchedKeys[k] = true
++		}
++		// Replace one module's cached contribution and its index entries -- but only if
++		// its phony output actually changed. A module that was regenerated incidentally
++		// (e.g. swept in by the reverse-dep closure of an unrelated edit) usually emits
++		// the same phonies as last build; skipping it leaves its (possibly huge) keys
++		// untouched, so the only keys re-derived are the ones whose deps really changed.
++		updateModule := func(m ModuleProxy) {
++			key := ctx.IncrementalModuleKey(m)
++			old := p.moduleContrib[key]
++			var contrib phonyMap
++			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok && len(info.Phonies) > 0 {
++				contrib = make(phonyMap, len(info.Phonies))
++				for k, v := range info.Phonies {
++					contrib[k] = append(Paths(nil), v...)
++				}
++			}
++			if samePhonyMap(old, contrib) {
++				return // unchanged contribution -> no keys touched, no re-derive
++			}
++			for k := range old {
++				removeOwner(k, key)
++			}
++			for k := range contrib {
++				addOwner(k, key)
++			}
++			if contrib == nil {
++				delete(p.moduleContrib, key)
++			} else {
++				p.moduleContrib[key] = contrib
++			}
++		}
++		// Regenerated (changed) and newly-added modules (updating a key twice is idempotent).
++		ctx.VisitRegeneratedModuleProxies(updateModule)
++		ctx.VisitAddedModuleProxies(updateModule)
++		// Removed modules: drop their contribution and index entries.
++		for _, key := range ctx.IncrementalRemovedKeys() {
++			for k := range p.moduleContrib[key] {
++				removeOwner(k, key)
++			}
++			delete(p.moduleContrib, key)
++		}
++		// Singleton-emitted phony keys that changed (added, removed, or different deps).
++		for k, v := range singletonPhonies {
++			if !samePaths(v, p.singletonPhonyMap[k]) {
++				touchedKeys[k] = true
++			}
++		}
++		for k := range p.singletonPhonyMap {
++			if _, ok := singletonPhonies[k]; !ok {
++				touchedKeys[k] = true
++			}
++		}
++		p.singletonPhonyMap = singletonPhonies
++		// Re-derive each touched key from its contributors (modules + singletons). A
++		// single edited aggregator module can touch thousands of keys, each with a large
++		// dep list, so the per-key SortedUniquePaths is fanned out across workers exactly
++		// like the full build's sort. The derive is read-only on the caches; results are
++		// applied to phonyMap serially afterward.
++		type rederived struct {
++			key   string
++			paths Paths
++		}
++		keys := make([]string, 0, len(touchedKeys))
++		for k := range touchedKeys {
++			keys = append(keys, k)
++		}
++		results := make([]rederived, len(keys))
++		var wg sync.WaitGroup
++		sem := make(chan struct{}, 2*runtime.NumCPU())
++		for i := range keys {
++			wg.Add(1)
++			sem <- struct{}{}
++			go func(i int) {
++				defer wg.Done()
++				defer func() { <-sem }()
++				k := keys[i]
++				var paths Paths
++				for mk := range p.keyOwners[k] {
++					paths = append(paths, p.moduleContrib[mk][k]...)
++				}
++				paths = append(paths, singletonPhonies[k]...)
++				if len(paths) > 0 {
++					paths = SortedUniquePaths(paths)
++				}
++				results[i] = rederived{k, paths}
++			}(i)
++		}
++		wg.Wait()
  
 -	// We will sort phonyList in parallel with other stuff later, but for now copy it into
 -	// a slice in series so that we don't read and write to phonyMap concurrently.
@@ -193,25 +293,72 @@ index 105477a05..8aab5829d 100644
 -	for phony := range p.phonyMap {
 -		p.phonyList = append(p.phonyList, phony)
 -	}
-+		// Merge the freshly-computed singleton phonies (computed above).
-+		for k, v := range singletonPhonies {
-+			p.phonyMap[k] = append(p.phonyMap[k], v...)
++		listChanged := false
++		for _, r := range results {
++			if len(r.paths) == 0 {
++				if _, ok := p.phonyMap[r.key]; ok {
++					delete(p.phonyMap, r.key)
++					listChanged = true
++				}
++			} else {
++				if _, ok := p.phonyMap[r.key]; !ok {
++					listChanged = true
++				}
++				p.phonyMap[r.key] = r.paths
++			}
++			touchedShards[phonyMkShardOf(r.key)] = true
 +		}
++		if listChanged {
++			p.phonyList = make([]string, 0, len(p.phonyMap))
++			for phony := range p.phonyMap {
++				p.phonyList = append(p.phonyList, phony)
++			}
++			sort.Strings(p.phonyList)
++		}
++	} else {
++		// FULL: build the merged phonyMap, the per-module contribution cache, and the
++		// keyOwners inverted index from scratch (cold build / first resident build).
++		p.phonyMap = make(phonyMap)
++		p.moduleContrib = make(map[string]phonyMap)
++		p.keyOwners = make(map[string]map[string]bool)
++		ctx.VisitAllModuleProxies(func(m ModuleProxy) {
++			if info, ok := OtherModuleProvider(ctx, m, ModulePhonyProvider); ok && len(info.Phonies) > 0 {
++				key := ctx.IncrementalModuleKey(m)
++				contrib := make(phonyMap, len(info.Phonies))
++				for k, v := range info.Phonies {
++					contrib[k] = append(Paths(nil), v...)
++					p.phonyMap[k] = append(p.phonyMap[k], v...)
++					owners := p.keyOwners[k]
++					if owners == nil {
++						owners = map[string]bool{}
++						p.keyOwners[k] = owners
++					}
++					owners[key] = true
++				}
++				p.moduleContrib[key] = contrib
++			}
++		})
  
 -	type phonyDef struct {
 -		name string
 -		deps Paths
 -	}
++		// Merge the freshly-computed singleton phonies (computed above).
++		for k, v := range singletonPhonies {
++			p.phonyMap[k] = append(p.phonyMap[k], v...)
++		}
++		p.singletonPhonyMap = singletonPhonies
+ 
+-	sortChan := make(chan phonyDef, len(p.phonyMap))
+-	resultsChan := make(chan phonyDef)
+-	var wg sync.WaitGroup
 +		// We will sort phonyList in parallel with other stuff later, but for now copy it
 +		// into a slice in series so that we don't read and write to phonyMap concurrently.
 +		p.phonyList = make([]string, 0, len(p.phonyMap))
 +		for phony := range p.phonyMap {
 +			p.phonyList = append(p.phonyList, phony)
 +		}
- 
--	sortChan := make(chan phonyDef, len(p.phonyMap))
--	resultsChan := make(chan phonyDef)
--	var wg sync.WaitGroup
++
 +		type phonyDef struct {
 +			name string
 +			deps Paths
@@ -255,16 +402,15 @@ index 105477a05..8aab5829d 100644
 -		wg.Wait()
 -		close(resultsChan)
 -	}()
--
--	for phony, deps := range p.phonyMap {
--		sortChan <- phonyDef{
--			name: phony,
--			deps: deps,
 +		for phony, deps := range p.phonyMap {
 +			sortChan <- phonyDef{name: phony, deps: deps}
 +		}
 +		close(sortChan)
-+
+ 
+-	for phony, deps := range p.phonyMap {
+-		sortChan <- phonyDef{
+-			name: phony,
+-			deps: deps,
 +		for result := range resultsChan {
 +			p.phonyMap[result.name] = result.deps
  		}
@@ -277,7 +423,7 @@ index 105477a05..8aab5829d 100644
 +			touchedShards[i] = true
 +		}
  	}
- 
+-
  	if !ctx.Config().KatiEnabled() {
 -		// In soong-only builds, the phonies can conflict with dist targets that will
 -		// be generated in the packaging step. Instead of emitting a blueprint/ninja phony directly,
@@ -310,6 +456,14 @@ index 105477a05..8aab5829d 100644
 -			for _, dep := range p.phonyMap[phony] {
 -				buildPhonyFileContents.WriteString(" ")
 -				buildPhonyFileContents.WriteString(dep.String())
+-			}
+-			buildPhonyFileContents.WriteString("\n")
+-		}
+-		if buildPhonyFileContents.Len() != phonyFileSize {
+-			panic(fmt.Sprintf("phonyFileSize calculation incorrect, expected %d, actual len: %d", phonyFileSize, buildPhonyFileContents.Len()))
+-		}
+-		buildPhonyFile := PathForOutput(ctx, "soong_phony_targets.mk")
+-		writeValueIfChanged(ctx, absolutePath(buildPhonyFile.String()), buildPhonyFileContents.String())
 +		for s := range touchedShards {
 +			var b strings.Builder
 +			for _, phony := range shardKeys[s] {
@@ -323,33 +477,31 @@ index 105477a05..8aab5829d 100644
 +					b.WriteString(dep.String())
 +				}
 +				b.WriteString("\n")
- 			}
--			buildPhonyFileContents.WriteString("\n")
--		}
--		if buildPhonyFileContents.Len() != phonyFileSize {
--			panic(fmt.Sprintf("phonyFileSize calculation incorrect, expected %d, actual len: %d", phonyFileSize, buildPhonyFileContents.Len()))
++			}
 +			f := PathForOutput(ctx, fmt.Sprintf("soong_phony_targets.%d.mk", s))
 +			writeValueIfChanged(ctx, absolutePath(f.String()), b.String())
- 		}
--		buildPhonyFile := PathForOutput(ctx, "soong_phony_targets.mk")
--		writeValueIfChanged(ctx, absolutePath(buildPhonyFile.String()), buildPhonyFileContents.String())
++		}
  	}
  }
  
 diff --git a/android/singleton.go b/android/singleton.go
-index 97e561466..f95a2310c 100644
+index 97e561466..ab2f300dc 100644
 --- a/android/singleton.go
 +++ b/android/singleton.go
-@@ -87,6 +87,8 @@ type SingletonContext interface {
+@@ -87,6 +87,12 @@ type SingletonContext interface {
  	VisitAllModulesBlueprint(visit func(blueprint.Module))
  	VisitAllModules(visit func(Module))
  	VisitAllModuleProxies(visit func(proxy ModuleProxy))
 +	VisitAddedModuleProxies(visit func(proxy ModuleProxy))
 +	IncrementalPureAdd() bool
++	VisitRegeneratedModuleProxies(visit func(proxy ModuleProxy))
++	IncrementalRemovedKeys() []string
++	IncrementalMembershipFold() bool
++	IncrementalModuleKey(proxy ModuleProxy) string
  	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
  	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
  
-@@ -358,6 +360,14 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
+@@ -358,6 +364,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
  	s.SingletonContext.VisitAllModuleProxies(visitProxyAdaptor(visit))
  }
  
@@ -359,6 +511,22 @@ index 97e561466..f95a2310c 100644
 +
 +func (s *singletonContextAdaptor) IncrementalPureAdd() bool {
 +	return s.SingletonContext.IncrementalPureAdd()
++}
++
++func (s *singletonContextAdaptor) VisitRegeneratedModuleProxies(visit func(proxy ModuleProxy)) {
++	s.SingletonContext.VisitRegeneratedModuleProxies(visitProxyAdaptor(visit))
++}
++
++func (s *singletonContextAdaptor) IncrementalRemovedKeys() []string {
++	return s.SingletonContext.IncrementalRemovedKeys()
++}
++
++func (s *singletonContextAdaptor) IncrementalMembershipFold() bool {
++	return s.SingletonContext.IncrementalMembershipFold()
++}
++
++func (s *singletonContextAdaptor) IncrementalModuleKey(proxy ModuleProxy) string {
++	return s.SingletonContext.IncrementalModuleKey(proxy.ModuleProxy)
 +}
 +
  func (s *singletonContextAdaptor) VisitAllModulesOrProxies(visit func(ModuleOrProxy)) {

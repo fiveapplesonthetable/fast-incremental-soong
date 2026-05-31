@@ -91,11 +91,42 @@ build/blueprint (base c39c8a4):
   incremental_mutation_test.go    byte-identical edit corpus
   ninja_defs.go, provider.go, singleton_ctx.go, name_interface.go, …  supporting
 
+## Add/remove cost: where the ~24 s goes, and the incremental-singleton fold
+
+A property edit keeps singletons and is cheap. An **add/remove** is a membership
+change, so the whole-graph singletons re-run. Measured breakdown of an f/b add's
+~24 s regen+write:
+
+```
+generateSingletonBuildActions  19.5 s   (the dominant cost)
+  phony (serial)               11.5 s  -> 8.0 s with the per-module fold below
+  parallel singleton batch     ~5.7 s   (59 singletons, run concurrently)
+  soongonlyandroidmk (serial)   2.8 s
+manifest write                  5.3 s
+module generation              0.06 s
+```
+
+The **phony singleton now folds incrementally** (`android/phony.go`,
+`moduleContrib` per-module contribution cache + `keyOwners` inverted index, fed by
+new `VisitRegeneratedModuleProxies` / `IncrementalRemovedKeys` /
+`IncrementalModuleKey` plumbing): a membership change re-derives only the phony keys
+whose contributors actually changed, byte-identically. It drops phony 11.5 s → 8 s.
+
+The residual 8 s is because an unrelated add still **regenerates**
+`framework-minus-apex-install-dependencies` — its `CalculateHashTolerant` property
+hash differs across the throwaway re-parse (a known re-parse non-determinism the
+diff already partly guards), so it is flagged "changed" and its ~3000-key phony is
+re-sorted. The real lever to make adds *fast* is therefore upstream of the
+singleton: make the re-parse property hash deterministic / add a deep-equal
+false-positive guard so an add is genuinely **pure**; the phony fold then collapses
+to ms, and module generation drops too. The remaining singletons (`androidmk`, the
+parallel batch) each need the same per-module fold to reach single-digit add.
+
 ## Not done yet / honest caveats
 
-- "Single-digit" is for a property edit's ninja generation; an **add/remove** is
-  dominated by singleton regeneration (~24 s) because a membership change re-runs
-  whole-graph singletons. Folding those incrementally is future work.
+- An **add/remove** is dominated by singleton regeneration (~22–24 s) — see above.
+  The phony fold is the first incremental singleton; the others are future work,
+  and the highest-leverage fix is the pure-add diff guard.
 - The full `m` wall still carries product-config (`dumpvars`, ~2.5 s) and a
   stock-`ninja` manifest reload, which are separate processes. A resident ninja
   (n2) and a dumpvars cache would remove them; the `ui/build/ninja_resident.go`
