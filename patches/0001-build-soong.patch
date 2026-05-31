@@ -469,7 +469,7 @@ index 105477a05..d4950b046 100644
  }
  
 diff --git a/android/singleton.go b/android/singleton.go
-index 97e561466..ea0abbe0b 100644
+index 97e561466..d26fd83a3 100644
 --- a/android/singleton.go
 +++ b/android/singleton.go
 @@ -21,6 +21,7 @@ import (
@@ -493,7 +493,7 @@ index 97e561466..ea0abbe0b 100644
  	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
  	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
  
-@@ -200,6 +207,44 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext)
+@@ -200,6 +207,48 @@ func (s *singletonAdaptor) GenerateBuildActions(ctx blueprint.SingletonContext)
  	}
  }
  
@@ -509,7 +509,7 @@ index 97e561466..ea0abbe0b 100644
 +// which touches its internal maps for every module but only emits per test suite, be
 +// skipped on the add of a non-test module. A panic is surfaced to the caller, which
 +// treats it as "differs" and falls back to a real re-run.
-+func (s *singletonAdaptor) ProbeContribution(ctx blueprint.SingletonContext) uint64 {
++func (s *singletonAdaptor) ProbeContribution(ctx blueprint.SingletonContext) (uint64, bool) {
 +	sctx := &singletonContextAdaptor{
 +		SingletonContext: ctx,
 +		phonies:          make(phonyMap),
@@ -520,7 +520,11 @@ index 97e561466..ea0abbe0b 100644
 +	s.Singleton.GenerateBuildActions(sctx)
 +	// Nothing above is committed: s.buildParams is untouched, dists are not appended to
 +	// the global sink, and no SingletonPhonyProvider is set. Hash and discard. The
-+	// tolerant hash skips Go funcs carried by Configurable so the value is stable.
++	// tolerant hash skips Go funcs carried by Configurable so the value is stable. The
++	// emitted bool lets the caller skip the empty-set baseline run when this singleton
++	// produced nothing over the probed modules (it then contributes nothing -- the
++	// common case for the add of a module it doesn't surface).
++	emitted := len(sctx.buildParams) > 0 || len(sctx.dists) > 0 || len(sctx.phonies) > 0
 +	sig := struct {
 +		Build   []BuildParams
 +		Dists   []dist
@@ -530,15 +534,15 @@ index 97e561466..ea0abbe0b 100644
 +	if err != nil {
 +		// Unhashable output -> return a value that won't match the empty-set baseline,
 +		// forcing a conservative re-run.
-+		return ^uint64(0)
++		return ^uint64(0), true
 +	}
-+	return h
++	return h, emitted
 +}
 +
  func (s *singletonAdaptor) BuildParamsForTests() []BuildParams {
  	return s.buildParams
  }
-@@ -358,6 +403,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
+@@ -358,6 +407,30 @@ func (s *singletonContextAdaptor) VisitAllModuleProxies(visit func(proxy ModuleP
  	s.SingletonContext.VisitAllModuleProxies(visitProxyAdaptor(visit))
  }
  

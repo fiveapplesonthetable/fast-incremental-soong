@@ -5675,10 +5675,10 @@ index 0000000..31b31f0
 +}
 diff --git a/incremental_singleton_probe.go b/incremental_singleton_probe.go
 new file mode 100644
-index 0000000..b722c51
+index 0000000..a6dd375
 --- /dev/null
 +++ b/incremental_singleton_probe.go
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,211 @@
 +// Copyright 2025 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5741,10 +5741,12 @@ index 0000000..b722c51
 +	// ProbeContribution runs this singleton's GenerateBuildActions over the modules
 +	// visible through ctx (a probe context restricted to a given module subset) in a
 +	// fully throwaway context that commits nothing, and returns a hash of everything it
-+	// emitted (build actions, dists, phonies). The incremental layer compares the hash
-+	// over the regenerated modules against the hash over the empty set: equal means the
-+	// regenerated modules added nothing to this singleton's output, so it can be skipped.
-+	ProbeContribution(ctx SingletonContext) uint64
++	// emitted (build actions, dists, phonies) plus whether it emitted anything. The
++	// incremental layer compares the hash over the regenerated modules against the hash
++	// over the empty set: equal means the regenerated modules added nothing to this
++	// singleton's output, so it can be skipped. When the regenerated-set run emitted
++	// nothing at all, it is restorable without the empty-set run.
++	ProbeContribution(ctx SingletonContext) (uint64, bool)
 +}
 +
 +// probeIdentity is the stable, build-to-build key for a module variant, matching the
@@ -5838,7 +5840,7 @@ index 0000000..b722c51
 +	// baseline (not "did it emit anything") is what lets a singleton that touches its
 +	// internal maps for every module -- but only emits per test suite / per real entry
 +	// -- be skipped on the add of a module it doesn't actually surface.
-+	sig := func(restrict []*moduleInfo) (h uint64, ok bool) {
++	sig := func(restrict []*moduleInfo) (h uint64, emitted, ok bool) {
 +		ok = true
 +		defer func() {
 +			if r := recover(); r != nil {
@@ -5861,18 +5863,32 @@ index 0000000..b722c51
 +			depProviders:  make(map[int]bool),
 +			probeRestrict: restrict,
 +		}
-+		h = pc.ProbeContribution(sctx)
++		h, emitted = pc.ProbeContribution(sctx)
 +		// A blueprint-level singleton emits into sctx.actionDefs rather than through the
 +		// soong adaptor; fold its size in so such a singleton is never wrongly skipped.
-+		h ^= uint64(len(sctx.actionDefs.buildDefs))*1469598103934665603 +
-+			uint64(len(sctx.actionDefs.variables))*1099511628211 +
-+			uint64(len(sctx.actionDefs.rules))
-+		return h, ok
++		n := len(sctx.actionDefs.buildDefs) + len(sctx.actionDefs.variables) + len(sctx.actionDefs.rules)
++		if n > 0 {
++			emitted = true
++			h ^= uint64(len(sctx.actionDefs.buildDefs))*1469598103934665603 +
++				uint64(len(sctx.actionDefs.variables))*1099511628211 +
++				uint64(len(sctx.actionDefs.rules))
++		}
++		return h, emitted, ok
 +	}
 +
-+	added, ok1 := sig(probeSet)
-+	empty, ok2 := sig([]*moduleInfo{})
-+	return ok1 && ok2 && added == empty
++	added, addedEmitted, ok1 := sig(probeSet)
++	if !ok1 {
++		return false
++	}
++	if !addedEmitted {
++		// The singleton produced nothing over the regenerated modules, so they
++		// contribute nothing to it (additive singleton): restorable without the
++		// second, empty-set run -- this skips ~half the probe work for the common
++		// case of adding a module a singleton doesn't surface.
++		return true
++	}
++	empty, _, ok2 := sig([]*moduleInfo{})
++	return ok2 && added == empty
 +}
 diff --git a/metrics/event_handler.go b/metrics/event_handler.go
 index 35a6858..24dde07 100644
