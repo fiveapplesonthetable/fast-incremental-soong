@@ -1108,9 +1108,13 @@ The cost is O(edit) only for the analysis. The full wall still carries the
 product-config and ninja-reload floors. Adding and removing a module are now warm
 too (and byte-identical to a cold resident rebuild), but they are a *membership
 change*: the whole-graph singletons re-aggregate over the new module set, so an
-add/remove is dominated by singleton regeneration (~24 s of the analysis) rather
-than being the few-seconds a property edit is. Folding those singletons
-incrementally is the next lever (chapters 45, 58).
+add/remove is dominated by singleton regeneration rather than being the
+few-seconds a property edit is. The phony singleton now folds incrementally,
+bringing the f/b add to **17.2 s** regen+write (byte-identical, 467/467 shards);
+the residual is `testsuites` (5.5 s), `soongonlyandroidmk` (2.9 s), the global
+order-only dedup in the write (5.8 s), and a phony false-positive (2.4 s). Folding
+those remaining singletons and the dedup is the next lever (chapters 45, 58, and
+the SUMMARY's "Why sub-second is NOT yet reached").
 
 ## 29. The soong_ui floor
 
@@ -1456,11 +1460,13 @@ The open piece is to express each singleton as an **incremental fold**: record e
 
 Until that lands, add/remove is warm but not cheap: on a membership change the
 whole-graph singletons are reset and **fully re-run** over the new module set
-(~24 s of the analysis), rather than folding just the one added/removed
-contribution. The output is byte-identical to a cold resident rebuild; only the
-cost is non-incremental. (The soong-only phony singleton already does a partial
-pure-add fold — it keeps the cached module phonies and merges only the added
-module, falling back to a full scan only if a singleton-emitted phony changed.)
+(17.2 s of regen+write, broken down in the SUMMARY), rather than folding just the
+one added/removed contribution. The output is byte-identical to a cold resident
+rebuild; only the cost is non-incremental. (The soong-only phony singleton now
+does the pure-add fold — it keeps the cached module phonies and re-derives only
+the keys whose contributing modules changed, falling back to a full scan only if a
+singleton-emitted phony changed. `testsuites`, `soongonlyandroidmk`, and the
+global order-only dedup in the write are the remaining whole-tree costs.)
 
 ## 46. Providers and propagation
 

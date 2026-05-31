@@ -1,50 +1,3 @@
-From 5a83c66766b2d62f86fe9aa99c43c94b006e7213 Mon Sep 17 00:00:00 2001
-From: Zimuzo Ezeozue <zezeozue@google.com>
-Date: Sat, 30 May 2026 14:40:16 +0000
-Subject: [PATCH] =?UTF-8?q?soong:=20resident=20warm-incremental=20build=20?=
- =?UTF-8?q?=E2=80=94=20O(edit)=20ninja=20generation=20+=20warm=20add?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Resident soong_build server (SOONG_PERSISTENT_REUSE_GRAPH=true) keeping the
-resolved+mutated graph and caches in RAM across builds, with changed-file-only
-reparse and the warm add/remove wiring. A warm edit reparses only the changed
-.bp files, re-mutates only the affected closure, regenerates only dirty modules,
-and delta-writes only the shards that changed.
-
-Measured on real AOSP (aosp_cf_x86_64_phone-trunk_staging-userdebug), all
-byte-identical to a cold rebuild (cmp, 403/403 shards):
-  - property edit (services.core.unboosted): analysis 131s -> 4.4s
-  - add a module: warm, 1 of 50 shards rewritten, ~34s wall (was a crash/fallback)
-  - remove a module: falls back to a correct full rebuild (name interface has no
-    ModuleRemover; next step)
-
-Includes: BeginIncrementalBuild before DiffParsedModules (nil-map crash fix);
-changed-file-only reparse with full-reparse fallback; add/remove routed through
-IncrementalAddModules/Remove with fallback. Local/experimental.
-
-Change-Id: Id5fffb376513e3028b76af007f85b687bd351126
----
- android/namespace.go               |  13 +
- android/phony.go                   | 370 ++++++++++++++++++++++------
- android/singleton.go               |  30 +++
- android/singleton_module.go        |  11 +
- cmd/soong_build/Android.bp         |   1 +
- cmd/soong_build/main.go            | 250 ++++++++++++++++++-
- cmd/soong_build/persistent.go      | 331 +++++++++++++++++++++++++
- docs/incremental_soong_tutorial.md | 343 ++++++++++++++++++++++++++
- docs/resident_incremental_build.md | 380 +++++++++++++++++++++++++++++
- ui/build/config.go                 |   5 +
- ui/build/ninja.go                  |  10 +
- ui/build/ninja_resident.go         | 120 +++++++++
- ui/build/soong.go                  |  41 ++++
- 13 files changed, 1819 insertions(+), 86 deletions(-)
- create mode 100644 cmd/soong_build/persistent.go
- create mode 100644 docs/incremental_soong_tutorial.md
- create mode 100644 docs/resident_incremental_build.md
- create mode 100644 ui/build/ninja_resident.go
-
 diff --git a/android/namespace.go b/android/namespace.go
 index 7d2ace2ca..17dcf9252 100644
 --- a/android/namespace.go
@@ -70,7 +23,7 @@ index 7d2ace2ca..17dcf9252 100644
  	r.rootNamespace.moduleContainer.NewSkippedModule(ctx, name, skipInfo)
  }
 diff --git a/android/phony.go b/android/phony.go
-index 105477a05..2e152a003 100644
+index 105477a05..d4950b046 100644
 --- a/android/phony.go
 +++ b/android/phony.go
 @@ -16,6 +16,7 @@ package android
@@ -81,7 +34,7 @@ index 105477a05..2e152a003 100644
  	"runtime"
  	"sort"
  	"strings"
-@@ -42,106 +43,329 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
+@@ -42,106 +43,360 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
  type phonySingleton struct {
  	phonyMap  phonyMap
  	phonyList []string
@@ -132,10 +85,38 @@ index 105477a05..2e152a003 100644
 +	}
 +	for k, av := range a {
 +		bv, ok := b[k]
-+		if !ok || !samePaths(av, bv) {
++		if !ok || !samePathsSet(av, bv) {
 +			return false
  		}
 -	})
++	}
++	return true
++}
++
++// samePathsSet reports whether two Paths have the same UNIQUE set of elements,
++// ignoring order AND duplicate count. The merged manifest runs SortedUniquePaths on
++// each key, so two contributions with the same unique set produce byte-identical
++// output even if they differ in order or in how many duplicates they carry -- a
++// module's GenerateBuildActions legitimately re-emits its deps in a different order
++// and with different duplication on a re-generation. Treating such a contribution as
++// unchanged lets the fold skip re-deriving that module's (possibly huge) keys. O(n)
++// via a set map (no sort), so it stays cheap even for tens of thousands of deps.
++func samePathsSet(a, b Paths) bool {
++	sa := make(map[string]struct{}, len(a))
++	for _, p := range a {
++		sa[p.String()] = struct{}{}
++	}
++	sb := make(map[string]struct{}, len(b))
++	for _, p := range b {
++		sb[p.String()] = struct{}{}
++	}
++	if len(sa) != len(sb) {
++		return false
++	}
++	for k := range sa {
++		if _, ok := sb[k]; !ok {
++			return false
++		}
 +	}
 +	return true
 +}
@@ -239,9 +220,12 @@ index 105477a05..2e152a003 100644
 +			}
 +			delete(p.moduleContrib, key)
 +		}
-+		// Singleton-emitted phony keys that changed (added, removed, or different deps).
++		// Singleton-emitted phony keys whose unique dep set changed (added, removed, or
++		// different deps). Order-insensitive (samePathsSet): singletons re-emit their many
++		// phonies in a different order each build, but the manifest sorts+dedups them, so a
++		// reordered-but-identical key is unchanged and must not be re-derived.
 +		for k, v := range singletonPhonies {
-+			if !samePaths(v, p.singletonPhonyMap[k]) {
++			if !samePathsSet(v, p.singletonPhonyMap[k]) {
 +				touchedKeys[k] = true
 +			}
 +		}
@@ -348,10 +332,7 @@ index 105477a05..2e152a003 100644
 +			p.phonyMap[k] = append(p.phonyMap[k], v...)
 +		}
 +		p.singletonPhonyMap = singletonPhonies
- 
--	sortChan := make(chan phonyDef, len(p.phonyMap))
--	resultsChan := make(chan phonyDef)
--	var wg sync.WaitGroup
++
 +		// We will sort phonyList in parallel with other stuff later, but for now copy it
 +		// into a slice in series so that we don't read and write to phonyMap concurrently.
 +		p.phonyList = make([]string, 0, len(p.phonyMap))
@@ -363,7 +344,10 @@ index 105477a05..2e152a003 100644
 +			name string
 +			deps Paths
 +		}
-+
+ 
+-	sortChan := make(chan phonyDef, len(p.phonyMap))
+-	resultsChan := make(chan phonyDef)
+-	var wg sync.WaitGroup
 +		sortChan := make(chan phonyDef, len(p.phonyMap))
 +		resultsChan := make(chan phonyDef)
 +		var wg sync.WaitGroup
@@ -2185,6 +2169,3 @@ index c9b303c5b..e3b1a0abd 100644
  	distFile(ctx, config, config.SoongVarsFile(), "soong")
  	distFile(ctx, config, config.SoongExtraVarsFile(), "soong")
  
--- 
-2.43.0
-

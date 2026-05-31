@@ -1,53 +1,3 @@
-From fc22bcd455fef307b9ad84ab9e705b2078232e03 Mon Sep 17 00:00:00 2001
-From: Zimuzo Ezeozue <zezeozue@google.com>
-Date: Sat, 30 May 2026 15:17:25 +0000
-Subject: [PATCH] =?UTF-8?q?blueprint:=20incremental=20warm-rebuild=20engin?=
- =?UTF-8?q?e=20=E2=80=94=20O(edit)=20analysis=20+=20write,=20warm=20add?=
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Content-addressed incremental analysis on a resident graph (baselines,
-DiffParsedModules, scoped re-mutation, provider-interface propagation) plus an
-O(edit) ninja write.
-
-This makes property edits, add-module and remove-module warm and byte-identical
-to a cold build, and keeps the write O(edit) across a membership change:
-  - ChangedBlueprintFiles: reparse only the .bp files whose content hash changed
-    (12 of 14,003 on a real edit; reparse ~4.4s -> ~0.4s);
-  - shard the multi-GB incremental-modules subninja like the main modules;
-  - shardModulesStable: content-addressed (hash-of-identity) shard assignment
-    instead of position-based ShardByCount, so adding/removing a module leaves
-    every other module in its shard -> delta write stays O(edit) on add (1 of 50
-    shards rewritten, was 50/50);
-  - reset each single-use singleton's generate-state before re-running on a
-    membership change, so add no longer panics (provenance_metadata,
-    all_aconfig_declarations) and produces byte-identical output.
-
-All verified byte-identical to cold on real AOSP. Local/experimental.
-
-Change-Id: I23773fd9aa72f2d582ea7b0c28d23cc4cd307230
----
- Android.bp                   |    4 +
- bootstrap/command.go         |   96 ++
- bootstrap/config.go          |    5 +
- context.go                   |  589 ++++++++---
- incremental.go               |   14 +
- incremental_mutation.go      | 1902 ++++++++++++++++++++++++++++++++++
- incremental_mutation_test.go | 1642 +++++++++++++++++++++++++++++
- incremental_ninja.go         |  959 +++++++++++++++++
- metrics/event_handler.go     |   12 +
- name_interface.go            |    8 +
- ninja_defs.go                |   17 +-
- proptools/hash_provider.go   |   31 +
- singleton_ctx.go             |   55 +
- timing_test_helpers_test.go  |    6 +
- 14 files changed, 5167 insertions(+), 173 deletions(-)
- create mode 100644 incremental_mutation.go
- create mode 100644 incremental_mutation_test.go
- create mode 100644 incremental_ninja.go
- create mode 100644 timing_test_helpers_test.go
-
 diff --git a/Android.bp b/Android.bp
 index 74308e0..5e9ba08 100644
 --- a/Android.bp
@@ -5772,6 +5722,3 @@ index 0000000..eeddc57
 +
 +func timeNow() time.Time                  { return time.Now() }
 +func timeSince(t time.Time) time.Duration { return time.Since(t) }
--- 
-2.43.0
-

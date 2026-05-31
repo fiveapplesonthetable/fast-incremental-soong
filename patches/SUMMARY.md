@@ -94,33 +94,74 @@ build/blueprint (base c39c8a4):
 ## Add/remove cost: where the ~24 s goes, and the incremental-singleton fold
 
 A property edit keeps singletons and is cheap. An **add/remove** is a membership
-change, so the whole-graph singletons re-run. Measured breakdown of an f/b add's
-~24 s regen+write:
+change, so the whole-graph singletons re-run. With the phony fold landed, the f/b
+add regen+write is **17.2 s** (467/467 shards byte-identical to a cold resident
+build). Fully profiled breakdown (per-singleton timers, this is the current state,
+not an estimate):
 
 ```
-generateSingletonBuildActions  19.5 s   (the dominant cost)
-  phony (serial)               11.5 s  -> 8.0 s with the per-module fold below
-  parallel singleton batch     ~5.7 s   (59 singletons, run concurrently)
-  soongonlyandroidmk (serial)   2.8 s
-manifest write                  5.3 s
-module generation              0.06 s
+generateSingletonBuildActions  11.3 s
+  parallel singleton batch      5.5 s   59 singletons concurrent; wall is bounded
+                                        by ONE long pole: testsuites 5.5 s
+                                        (next: tidy_phony_targets 2.8 s, all_teams 0.9 s)
+  soongonlyandroidmk (serial)   2.9 s
+  phony (serial)                2.4 s   folded; this is the residual false-positive (below)
+  other serial (aconfig,…)      0.5 s
+manifest write (WriteBuildFile) 5.8 s   O(tree): iterateAllVariants + sort + global
+                                        deduplicateOrderOnlyDeps (cross-module)
 ```
 
-The **phony singleton now folds incrementally** (`android/phony.go`,
-`moduleContrib` per-module contribution cache + `keyOwners` inverted index, fed by
-new `VisitRegeneratedModuleProxies` / `IncrementalRemovedKeys` /
-`IncrementalModuleKey` plumbing): a membership change re-derives only the phony keys
-whose contributors actually changed, byte-identically. It drops phony 11.5 s → 8 s.
+The **phony singleton folds incrementally** (`android/phony.go`, `moduleContrib`
+per-module contribution cache + `keyOwners` inverted index, fed by new
+`VisitRegeneratedModuleProxies` / `IncrementalRemovedKeys` / `IncrementalModuleKey`
+plumbing): a membership change re-derives only the phony keys whose contributors
+actually changed, byte-identically. It drops phony from ~11.5 s to a 2.4 s residual.
 
-The residual 8 s is because an unrelated add still **regenerates**
+That 2.4 s residual is because an unrelated add still **regenerates**
 `framework-minus-apex-install-dependencies` — its `CalculateHashTolerant` property
-hash differs across the throwaway re-parse (a known re-parse non-determinism the
-diff already partly guards), so it is flagged "changed" and its ~3000-key phony is
-re-sorted. The real lever to make adds *fast* is therefore upstream of the
-singleton: make the re-parse property hash deterministic / add a deep-equal
-false-positive guard so an add is genuinely **pure**; the phony fold then collapses
-to ms, and module generation drops too. The remaining singletons (`androidmk`, the
-parallel batch) each need the same per-module fold to reach single-digit add.
+hash differs across the throwaway re-parse (the `Configurable` `inner` pointer-chain
+is rebuilt structurally-distinct, so the content hash differs even though the .bp
+text is unchanged), so it is flagged "changed" and its ~3000-key phony is re-sorted.
+The clean fix is a deterministic re-parse hash or a deep-equal false-positive guard
+in `DiffParsedModules` so an add is genuinely **pure**; the phony fold then collapses
+to ms.
+
+### Why sub-second add/remove is NOT yet reached, and what it needs
+
+The remaining 17 s is **not** one bottleneck — it is three near-independent
+whole-tree phases, each needing its own incremental treatment:
+
+1. **`testsuites` 5.5 s + `soongonlyandroidmk` 2.9 s + the phony residual 2.4 s** —
+   whole-graph singletons that `VisitAllModules` and aggregate. Each re-runs in full
+   on a membership change. Folding each requires the same per-module-contribution
+   treatment the phony singleton got — a real, proven, but **per-singleton** effort
+   in Soong code (`android/`), one CL each.
+2. **`WriteBuildFile` 5.8 s** — `deduplicateOrderOnlyDeps` is a *global* operation
+   (it discovers order-only dep-sets shared *across* modules), so it is genuinely
+   O(tree) and not trivially incremental; the delta *shard* write is already O(edit).
+
+Two generic shortcuts were investigated this session and rejected on soundness:
+
+- **Provider-hash singleton restore** (cache a singleton keyed by the provider
+  value-hashes it read; restore if unchanged) is implemented but **inert**: in the
+  resident config `GetIncrementalEnabled()` is false, and more fundamentally most
+  Soong singletons read module *fields directly* (not via tracked `OtherModuleProvider`),
+  so their `depProviders` set is empty and they are never cacheable. Making it fire
+  would require migrating each singleton to declare its inputs as providers.
+- **Restricted-visit pure-add probe** (run each singleton with `VisitAll*` restricted
+  to only the added modules; if it emits nothing, the whole-graph output is unchanged
+  → restore the cached output). The aggregation argument is sound, but a probe run
+  cannot be cleanly isolated: `setSingletonProvider` writes to the real
+  `singletonInfo.providerInfo` and `DistForGoal`/etc. mutate global `Context` state,
+  so a throwaway probe pollutes real state. Not safely mergeable without intercepting
+  the full side-effect surface.
+
+So the honest path to sub-second add/remove is: (a) the pure-add diff guard (kills the
+phony residual, ~2.4 s), then (b) a per-singleton fold for `testsuites` and
+`soongonlyandroidmk` following the phony template (~8 s), then (c) an incremental or
+cached order-only dedup for the write (~5 s). Each is a discrete, byte-gated CL; none
+is a single-commit quick win, and several carry real divergence risk that the
+byte-gate must police.
 
 ## Not done yet / honest caveats
 
