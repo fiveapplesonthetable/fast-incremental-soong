@@ -4,25 +4,35 @@ Make AOSP's analysis phase incremental: edit one `Android.bp`, regenerate
 `build.ninja` in seconds instead of re-analyzing the whole tree — **byte-identical
 to a clean build**, measured on real AOSP.
 
-> **Status (checkpoint `v0.8`):** all three warm `frameworks/base/Android.bp` edit
-> classes are byte-identical to a cold resident rebuild (all 1067 ninja+mk shards),
-> on the warm path (no fallback), clean exit:
+> **Status (checkpoint `v0.8.1`):** warm `frameworks/base/Android.bp` rebuilds,
+> regenerate+write, byte-identical to a cold resident rebuild (all 1067 ninja+mk
+> shards), warm path, clean exit:
 >
 > | edit | regenerate+write | from |
 > |---|--:|--:|
-> | **add** a module | **~0.71 s** | ~24 s |
-> | **remove** a module | **~0.73 s** | ~24 s |
-> | **property edit** (worst case: `framework-minus-apex-defaults`) | **~1.27 s** | ~4.5 s |
+> | **add** a module | **~0.76 s** | ~24 s |
+> | **remove** a module | **~0.80 s** | ~24 s |
+> | **property edit** (worst case: `framework-minus-apex-defaults`) | **~1.64 s** | ~4.5 s |
 >
 > Add/remove are sub-second. The property edit shown is the *worst case* — editing
-> the defaults for the entire framework jar — and its residual ~1.27 s is intrinsic:
+> the defaults for the entire framework jar — and its residual ~1.64 s is intrinsic:
 > reparse the large `Android.bp` (~0.4 s) + **regenerate the framework jar's analysis**
-> (the heavy `framework-minus-apex` modules, ~0.6 s even parallelized) + rewrite the
-> ~18 manifest shards that changed (~0.3 s). A leaf edit pays only the reparse + a tiny
-> generate and is sub-second. The edit was also made *deterministically* byte-identical
-> (it previously depended on a flaky re-parse hash to re-mutate `java_defaults`
-> consumers; now a propagating-dependency-tag closure does it for sure). See
-> `patches/SUMMARY.md` for the per-fix breakdown.
+> (the heavy `framework-minus-apex` modules, ~1.1 s) + rewrite the ~18 manifest shards
+> that changed (~0.3 s). A leaf edit pays only the reparse + a tiny generate and is
+> sub-second. The edit was also made *deterministically* byte-identical (it previously
+> depended on a flaky re-parse hash to re-mutate `java_defaults` consumers; now a
+> propagating-dependency-tag closure does it for sure).
+>
+> **Verified edit classes (corpus, `poc_fb_corpus.sh`):** property edit, `java_defaults`
+> edit, direct module-property edit, add-module, remove-module are each byte-identical.
+> **Known gap:** a *filegroup-srcs* edit (e.g. reordering `framework-non-updatable-sources`)
+> is **not** byte-identical — its consumers regenerate via `interfaceChanged`, which is
+> computed with a tolerant provider hash that misses func-valued/non-deterministic
+> provider changes (the same unsoundness the `java_defaults` closure side-steps), so
+> ~6 consumer shards stay stale. This is a pre-existing limitation of the warm path's
+> generate-time propagation, not introduced by these caches; it needs the deterministic
+> provider-propagation work (the redesign). Until then the warm path should not be
+> trusted for filegroup-srcs edits. See `patches/SUMMARY.md` for the breakdown.
 
 ## What it does
 

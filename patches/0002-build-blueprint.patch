@@ -4883,10 +4883,10 @@ index 0000000..71a60b0
 +}
 diff --git a/incremental_ninja.go b/incremental_ninja.go
 new file mode 100644
-index 0000000..7e30de8
+index 0000000..49ea68e
 --- /dev/null
 +++ b/incremental_ninja.go
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1254 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5361,69 +5361,52 @@ index 0000000..7e30de8
 +		add(m)
 +	}
 +
-+	// Process the affected worklist in PARALLEL: ready modules (all their affected deps
-+	// done) are independent, so they generate concurrently -- bounded by parallelVisitLimit,
-+	// exactly like the cold build's parallelVisit. The topological bookkeeping (remaining
-+	// counts, interface-change propagation via add()) is serialized under mu; only the
-+	// expensive generateOneModule runs outside it. generateOneModule is concurrency-safe
-+	// (it locks liveGlobals), and resetModuleBuildActions + generate touch only their own,
-+	// exclusively-owned module, so the result is byte-identical to the cold parallel
-+	// generate. This overlaps the few heavy modules a central edit regenerates (e.g. the
-+	// framework-minus-apex family) instead of summing their times serially.
-+	var mu sync.Mutex
-+	cond := sync.NewCond(&mu)
-+	active := 0
-+	var launch func()
-+	launch = func() { // caller holds mu
-+		for len(ready) > 0 && active < parallelVisitLimit {
-+			m := ready[len(ready)-1]
-+			ready = ready[:len(ready)-1]
-+			if done[m] || remaining[m] > 0 {
-+				// Stale ready entry: a dependency became affected after m was queued.
-+				continue
++	// Process the affected worklist in dependency order. A module is generated only once
++	// every affected dep it has is done (remaining==0). The affected set GROWS dynamically:
++	// when a generated module's exported interface changed, its reverse-deps must regenerate
++	// too (add()), and add() increments the remaining count of any already-affected, not-yet-
++	// done dependent so it waits for the newly-affected dep. This is processed SERIALLY: the
++	// dynamic growth means a module's dep can become affected after the module was queued, so
++	// concurrent generation would race a dependent against a still-regenerating dependency
++	// (a filegroup edit that cascades to many consumers does exactly this). The few heavy
++	// modules a central edit regenerates are the cost; a parallel version would need the cold
++	// build's pause/resume to be safe here.
++	for len(ready) > 0 {
++		m := ready[len(ready)-1]
++		ready = ready[:len(ready)-1]
++		if done[m] || remaining[m] > 0 {
++			// Stale ready entry: a dependency became affected after m was queued.
++			continue
++		}
++		// A propagated (not pre-reset) module must be reset before regenerating; a dirty
++		// (re-mutated) module was already reset by re-mutation.
++		if !c.dirtyModules[m] {
++			c.resetModuleBuildActions(m)
++		}
++		nd, es := c.generateOneModule(config, m, liveGlobals)
++		deps = append(deps, nd...)
++		if len(es) > 0 {
++			errs = append(errs, es...)
++			break
++		}
++		done[m] = true
++		// Unblock affected reverse-deps that were waiting on m.
++		for _, rd := range m.reverseDeps {
++			if inAffected[rd] && !done[rd] {
++				remaining[rd]--
++				if remaining[rd] == 0 {
++					ready = append(ready, rd)
++				}
 +			}
-+			active++
-+			go func(m *moduleInfo) {
-+				// A propagated (not pre-reset) module must be reset before regenerating; a
-+				// dirty (re-mutated) module was already reset by re-mutation. Reset touches
-+				// only m, which this worker exclusively owns.
-+				if !c.dirtyModules[m] {
-+					c.resetModuleBuildActions(m)
-+				}
-+				nd, es := c.generateOneModule(config, m, liveGlobals)
-+				mu.Lock()
-+				deps = append(deps, nd...)
-+				errs = append(errs, es...)
-+				done[m] = true
-+				// Unblock affected reverse-deps that were waiting on m.
-+				for _, rd := range m.reverseDeps {
-+					if inAffected[rd] && !done[rd] {
-+						remaining[rd]--
-+						if remaining[rd] == 0 {
-+							ready = append(ready, rd)
-+						}
-+					}
-+				}
-+				// If m's interface changed, its (other) reverse-deps must regenerate too.
-+				// m is already done, so add() won't miscount it.
-+				if m.interfaceChanged {
-+					for _, rd := range m.reverseDeps {
-+						add(rd)
-+					}
-+				}
-+				active--
-+				launch()
-+				cond.Broadcast()
-+				mu.Unlock()
-+			}(m)
++		}
++		// If m's interface changed, its (other) reverse-deps must regenerate too. m is
++		// already done, so add() won't miscount it.
++		if m.interfaceChanged {
++			for _, rd := range m.reverseDeps {
++				add(rd)
++			}
 +		}
 +	}
-+	mu.Lock()
-+	launch()
-+	for active > 0 {
-+		cond.Wait()
-+	}
-+	mu.Unlock()
 +
 +	// Fold ONLY the regenerated modules' new interfaces back into the resident
 +	// baseline (O(affected), not the O(tree) commitInterfaceHashes over all

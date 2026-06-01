@@ -1085,7 +1085,7 @@ soong analysis, in the daemon:
                           incremental-modules subninja is sharded the same way);
                           the rest are left on disk untouched.
   total          ~4.4 s   byte-identical to a cold rebuild.
-                          (v0.8: now ~0.71s add / ~0.73s remove / ~1.27s edit --
+                          (v0.8: now ~0.76s add / ~0.80s remove / ~1.64s edit --
                           the dedup, singleton and sort/shard recomputes that
                           dominated this number are now O(edit) caches; see ch. 58.)
 
@@ -1912,14 +1912,19 @@ unchanged), and the sorted+content-addressed-sharded module lists. Cache each, k
 on what genuinely changed (a per-module order-only *fingerprint* for the dedup; the
 probe-kept set for singletons; pointer-identity of the module set for the sort/shard
 layout), and they collapse to O(edit): dedup 1.1s→1ms, singletons 0.9s→<1ms, sort+
-shard 0.4s→0ms. The targeted generate, which had been serial, now regenerates the
-affected modules in parallel like the cold build (a central edit's few heavy modules
-overlap instead of summing). Net on real AOSP, regenerate+write: **add ~0.71s,
-remove ~0.73s, property edit ~1.27s** (the worst case shown is editing
-`framework-minus-apex-defaults`, the defaults for the entire framework jar; a leaf
-edit is sub-second). The property edit's residual ~1.27s is intrinsic — reparse the
-large `Android.bp`, regenerate the framework jar's analysis, rewrite the ~18 shards
-that changed — not overhead.
+shard 0.4s→0ms. Net on real AOSP, regenerate+write: **add ~0.76s, remove ~0.80s,
+property edit ~1.64s** (the worst case shown is editing `framework-minus-apex-defaults`,
+the defaults for the entire framework jar; a leaf edit is sub-second). The property
+edit's residual ~1.64s is intrinsic — reparse the large `Android.bp`, regenerate the
+framework jar's analysis (~1.1s, serial), rewrite the ~18 shards that changed — not
+overhead.
+
+(I also tried parallelizing the targeted generate, to overlap a central edit's few
+heavy modules; it shaved the edit to ~1.27s but **crashed on a filegroup edit** — that
+edit grows the affected set dynamically across dependency edges, so a dependent could
+race a still-regenerating dependency. The worklist's topological ordering is only safe
+serially without the cold build's pause/resume, so I reverted it. The corpus caught
+this; without it the racy version would have shipped.)
 
 That edit was also made *deterministically* byte-identical. The earlier
 consumer-regeneration fix (chapter 53) relied on the re-parse property hash flagging
@@ -1931,6 +1936,19 @@ re-mutation expands the changed set to the transitive reverse-dep closure over t
 tags, so every defaults consumer re-mutates for sure, independent of the hash. The
 closure follows only propagating edges, so it stays the defaults-consumer set, not
 the whole reverse-dep graph.
+
+**A gap this same corpus found, recorded honestly:** the fix above covers the
+*mutate-time* defaults propagation. The *generate-time* propagation — a consumer that
+reads a dependency's output (a `filegroup`'s srcs) at GenerateBuildActions, picked up
+via `interfaceChanged` — still rides the tolerant provider hash, which skips func-valued
+providers and is non-deterministic for the same framework modules. So a filegroup-srcs
+edit (reordering `framework-non-updatable-sources`) leaves ~6 consumer shards stale: not
+byte-identical. It is the same soundness hole, one layer down, and it needs the same
+medicine (a deterministic, total provider hash, or the content-addressed-query redesign
+where there is no separate warm path to keep faithful). Until then the warm path is
+trustworthy for property / defaults / direct / add / remove edits but not for
+filegroup-srcs edits — which is exactly the kind of thing the byte-verification corpus
+exists to keep honest.
 
 ## 59. File-scoped reparse
 

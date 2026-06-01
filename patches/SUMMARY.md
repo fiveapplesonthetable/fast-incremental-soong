@@ -7,11 +7,35 @@ soong-only, `m nothing`), edit on **`frameworks/base/Android.bp`** (the realisti
 worst case). Every warm result was verified `cmp`-identical to a cold resident
 rebuild of the same edited tree (every ninja + `.mk` shard).
 
-## v0.8 — warm property edit O(edit), and deterministic (latest)
+## v0.8.1 — corpus verification + a caught regression (latest)
 
-A warm property edit is now byte-identical to a cold resident rebuild **on every
-run**, and O(edit). The worst case -- editing `framework-minus-apex-defaults`, the
-`java_defaults` for the entire framework jar -- went from **4.5 s to ~1.27 s**
+Verified the warm edit path across edit kinds (`poc_fb_corpus.sh`): a **property
+edit**, a **`java_defaults` edit**, a **direct module-property edit**, **add-module**,
+and **remove-module** are each byte-identical to a cold resident rebuild. The corpus
+found two things worth recording:
+
+- **A regression I introduced and reverted.** v0.8 parallelized the targeted generate.
+  It crashed on a *filegroup* edit: that edit grows the affected set dynamically across
+  dependency edges (a consumer becomes affected mid-generate via `interfaceChanged`), so
+  a dependent could race a still-regenerating dependency and panic in `SetProvider` /
+  `VisitDirectDeps`. The simpler add/remove/defaults edits never exercised that pattern.
+  Reverted to the serial worklist (correct for every edit class; a correct parallel
+  version needs the cold build's pause/resume). Edit worst case is now **~1.64 s** instead
+  of ~1.27 s, but correct.
+- **A pre-existing gap.** A *filegroup-srcs* edit (e.g. reordering
+  `framework-non-updatable-sources`) is **not** byte-identical even serially: ~6 consumer
+  shards stay stale. Their regeneration rides `interfaceChanged`, which is computed with a
+  tolerant provider hash (`CalculateHashTolerant`) that skips func-valued providers and is
+  non-deterministic for some modules -- the *same* unsoundness the `java_defaults` closure
+  side-steps. This is the warm path's generate-time-propagation soundness problem (the
+  redesign's core); the dedup/sort/shard caches did not introduce it. The warm path should
+  not be trusted for filegroup-srcs edits until that propagation is made sound.
+
+## v0.8 — warm property edit O(edit), and deterministic
+
+A warm property edit is byte-identical to a cold resident rebuild **on every run**, and
+O(edit). The worst case -- editing `framework-minus-apex-defaults`, the `java_defaults`
+for the entire framework jar -- went from **4.5 s to ~1.64 s** (v0.8.1, serial generate)
 regenerate+write (1067 shards, differing=0); a leaf edit is sub-second.
 
 **Correctness (the important fix).** A `java_defaults` edit changes the MERGED
@@ -26,24 +50,21 @@ tags. Following only propagating edges keeps the closure to the defaults-consume
 (a defaults module's reverse-deps are its consumers, not the libraries that link what
 they build), so it stays O(edit). Byte-identical on 3/3 runs.
 
-**Speed (4.5 s -> ~1.27 s).** Three O(edit) caches, all gated behind
-`residentNinjaLayout()`:
+**Speed (4.5 s -> ~1.64 s).** Two O(edit) caches, gated behind `residentNinjaLayout()`
+(a third, parallel generate, was reverted in v0.8.1 -- see above):
 1. **Sound order-only fingerprint dedup cache.** The dedup recomputed over the whole
    tree (and re-serialized the phonys subninja) every edit. Cache the dedup decision +
    each module's order-only key-set fingerprint; reuse it when no regenerated module
    changed its order-only key set, and remap only the regenerated modules. The
    fingerprint -- not the tolerant provider hash -- is the sound edit test. dedup
    1.1 s -> 1 ms.
-2. **Parallel targeted generate.** The affected modules regenerated serially, so an
-   edit touching a few heavy modules paid the sum. Generate the affected worklist in
-   parallel (bounded, like the cold build's parallelVisit). generate 1.1 s -> ~0.63 s.
-3. **Cached sorted+sharded module lists.** A non-membership edit has a pointer-
+2. **Cached sorted+sharded module lists.** A non-membership edit has a pointer-
    identical module set, so reuse last build's sort order + content-addressed shard
    assignment instead of re-sorting+re-hashing the tree. writeAllModuleActions
    0.79 s -> ~0.59 s.
 
-The residual ~1.27 s is intrinsic to a framework-wide edit (reparse ~0.4 s +
-regenerate the framework jar's analysis ~0.6 s + rewrite the ~18 changed shards
+The residual ~1.64 s is intrinsic to a framework-wide edit (reparse ~0.4 s +
+regenerate the framework jar's analysis ~1.1 s serial + rewrite the ~18 changed shards
 ~0.3 s) -- no cache can skip producing output that actually changed.
 
 ## v0.7s — sub-second add/remove
