@@ -159,7 +159,7 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..fb23dd9 100644
+index 199171c..8c5f349 100644
 --- a/context.go
 +++ b/context.go
 @@ -19,11 +19,9 @@ import (
@@ -223,7 +223,7 @@ index 199171c..fb23dd9 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +223,135 @@ type Context struct {
+@@ -190,6 +223,160 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -356,10 +356,35 @@ index 199171c..fb23dd9 100644
 +	// until the first resident dedup.
 +	cachedOrderOnlyPhonys *localBuildActions
 +
++	// cachedDedupNames is the order-only dedup DECISION from the last build: each
++	// deduplicated key -> its phony name. When orderOnlyDedupReusable confirms no
++	// regenerated/added/removed module changed its order-only key set, the decision is
++	// still exact, so a warm rebuild reuses it to remap only the regenerated modules'
++	// fresh build defs (O(edit)) instead of recounting + rewriting every module (O(tree)).
++	cachedDedupNames map[uniquelist.UniqueList[string]]string
++
++	// orderOnlyFingerprints is each module's order-only key-set fingerprint from the last
++	// full dedup. A warm rebuild compares a regenerated module's current fingerprint
++	// against it: equal means the module's order-only deps are unchanged, so it cannot have
++	// shifted any dedup count. This is the SOUND change test for a property edit (the
++	// tolerant provider hash is not -- a func-valued provider edit it skips would wrongly
++	// pass), letting an edit reuse the dedup decision the way an add/remove already does.
++	orderOnlyFingerprints map[*moduleInfo]uint64
++
++	// cachedSortedModules / cachedSortedIncModules / cachedShardedModules hold the sorted
++	// module lists and the content-addressed shard assignment from the last build. A
++	// non-membership warm rebuild (a property edit: no module added or removed) has a
++	// pointer-identical module set, so the sort order and shard assignment are unchanged;
++	// reusing them skips the O(n log n) sort and the O(tree) shard hashing over the whole
++	// tree. Recomputed (and refreshed) on a cold build or a membership change.
++	cachedSortedModules    []*moduleInfo
++	cachedSortedIncModules []*moduleInfo
++	cachedShardedModules   [][]*moduleInfo
++
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +523,21 @@ type moduleInfo struct {
+@@ -361,6 +548,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -381,7 +406,7 @@ index 199171c..fb23dd9 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +589,12 @@ type moduleInfo struct {
+@@ -412,6 +614,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -394,7 +419,7 @@ index 199171c..fb23dd9 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,10 +971,6 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +996,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
@@ -405,7 +430,7 @@ index 199171c..fb23dd9 100644
  func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
  	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
  		return err
-@@ -2936,7 +3115,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2936,7 +3140,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -419,7 +444,7 @@ index 199171c..fb23dd9 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3175,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3200,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -451,7 +476,7 @@ index 199171c..fb23dd9 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3215,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3240,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -473,7 +498,7 @@ index 199171c..fb23dd9 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3545,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3570,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -492,7 +517,7 @@ index 199171c..fb23dd9 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3371,6 +3595,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3620,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -513,7 +538,7 @@ index 199171c..fb23dd9 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,93 +3630,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3655,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -611,7 +636,7 @@ index 199171c..fb23dd9 100644
  			return false
  		})
  
-@@ -3487,6 +3644,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3487,6 +3669,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	errs = append(errs, visitErrs...)
  
@@ -622,7 +647,7 @@ index 199171c..fb23dd9 100644
  	return deps, errs
  }
  
-@@ -3597,8 +3758,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3783,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -636,7 +661,7 @@ index 199171c..fb23dd9 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3620,7 +3784,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3620,7 +3809,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  }
  
  func (c *Context) generateParallelSingletonBuildActions(config interface{},
@@ -646,7 +671,7 @@ index 199171c..fb23dd9 100644
  
  	c.BeginEvent("generateParallelSingletonBuildActions")
  	defer c.EndEvent("generateParallelSingletonBuildActions")
-@@ -3654,6 +3819,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3654,6 +3844,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  			// Skip any singletons registered with parallel=false.
  			continue
  		}
@@ -657,7 +682,7 @@ index 199171c..fb23dd9 100644
  		wg.Add(1)
  		go func(inf *singletonInfo) {
  			defer wg.Done()
-@@ -3670,33 +3839,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3670,33 +3864,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
@@ -729,7 +754,7 @@ index 199171c..fb23dd9 100644
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,8 +3896,113 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,8 +3921,113 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -843,7 +868,7 @@ index 199171c..fb23dd9 100644
  		c.BeginEvent("singleton:" + info.name)
  		defer c.EndEvent("singleton:" + info.name)
  		newDeps, newErrs := c.generateOneSingletonBuildActions(config, info, liveGlobals)
-@@ -3722,11 +4015,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3722,11 +4040,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -864,7 +889,7 @@ index 199171c..fb23dd9 100644
  
  	for _, info := range singletons {
  		if !info.parallel {
-@@ -4596,7 +4896,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+@@ -4596,7 +4921,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -882,7 +907,7 @@ index 199171c..fb23dd9 100644
  			return
  		}
  	})
-@@ -4849,10 +5158,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5183,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -895,7 +920,70 @@ index 199171c..fb23dd9 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
-@@ -4900,7 +5208,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4865,31 +5198,43 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+ 	var modules []*moduleInfo
+ 	var incModules []*moduleInfo
+ 
+-	for module := range c.iterateAllVariants() {
+-		if module.incrementalSupported {
+-			incModules = append(incModules, module)
+-			continue
++	// A non-membership warm rebuild (a property edit) has a pointer-identical module set,
++	// so last build's sorted lists are still in the right order -- reuse them and skip
++	// rebuilding + re-sorting the whole tree.
++	membershipStable := c.dirtyModules != nil && !c.membershipChanged &&
++		c.cachedSortedModules != nil
++	if membershipStable {
++		modules = c.cachedSortedModules
++		incModules = c.cachedSortedIncModules
++	} else {
++		for module := range c.iterateAllVariants() {
++			if module.incrementalSupported {
++				incModules = append(incModules, module)
++				continue
++			}
++			modules = append(modules, module)
+ 		}
+-		modules = append(modules, module)
+-	}
+ 
+-	// cachedNameModuleLess is similar to moduleLess, but uses the namespaced name cached in
+-	// moduleInfo.uniqueName instead of recomputing it each time.
+-	cachedNameModuleLess := func(a, b *moduleInfo) int {
+-		if a.cachedUniqueName == b.cachedUniqueName {
+-			if a.variant.name == b.variant.name {
+-				panic(fmt.Sprintf("duplicate module name: %s %s: %#v and %#v\n",
+-					a.cachedUniqueName, a.variant.name, a.variant.variations, a.variant.variations))
++		// cachedNameModuleLess is similar to moduleLess, but uses the namespaced name cached in
++		// moduleInfo.uniqueName instead of recomputing it each time.
++		cachedNameModuleLess := func(a, b *moduleInfo) int {
++			if a.cachedUniqueName == b.cachedUniqueName {
++				if a.variant.name == b.variant.name {
++					panic(fmt.Sprintf("duplicate module name: %s %s: %#v and %#v\n",
++						a.cachedUniqueName, a.variant.name, a.variant.variations, a.variant.variations))
++				} else {
++					return cmp.Compare(a.variant.name, b.variant.name)
++				}
+ 			} else {
+-				return cmp.Compare(a.variant.name, b.variant.name)
++				return cmp.Compare(a.cachedUniqueName, b.cachedUniqueName)
+ 			}
+-		} else {
+-			return cmp.Compare(a.cachedUniqueName, b.cachedUniqueName)
+ 		}
+-	}
+ 
+-	slices.SortFunc(modules, cachedNameModuleLess)
+-	slices.SortFunc(incModules, cachedNameModuleLess)
++		slices.SortFunc(modules, cachedNameModuleLess)
++		slices.SortFunc(incModules, cachedNameModuleLess)
++		c.cachedSortedModules = modules
++		c.cachedSortedIncModules = incModules
++	}
+ 
+ 	phonys := c.deduplicateOrderOnlyDeps(append(modules, incModules...))
+ 
+@@ -4900,7 +5245,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
@@ -911,7 +999,7 @@ index 199171c..fb23dd9 100644
  		return err
  	}
  
-@@ -4914,9 +5229,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5266,47 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
@@ -922,7 +1010,14 @@ index 199171c..fb23dd9 100644
 +		// manifest layout is byte-identical to upstream.
 +		var shardedModules [][]*moduleInfo
 +		if c.residentNinjaLayout() {
-+			shardedModules = shardModulesStable(modules, len(files))
++			// A non-membership warm rebuild keeps every module in the same shard (content-
++			// addressed), so reuse the cached assignment instead of re-hashing the tree.
++			if membershipStable && len(c.cachedShardedModules) == len(files) {
++				shardedModules = c.cachedShardedModules
++			} else {
++				shardedModules = shardModulesStable(modules, len(files))
++				c.cachedShardedModules = shardedModules
++			}
 +		} else {
 +			shardedModules = proptools.ShardByCount(modules, len(files))
 +		}
@@ -953,7 +1048,7 @@ index 199171c..fb23dd9 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5292,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5336,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -1029,7 +1124,7 @@ index 199171c..fb23dd9 100644
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5432,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5476,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -1043,7 +1138,7 @@ index 199171c..fb23dd9 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +5515,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5559,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -1080,7 +1175,7 @@ index 199171c..fb23dd9 100644
  			return err
  		}
  	}
-@@ -5270,39 +5693,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5737,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -1158,10 +1253,10 @@ index ad27b1f..13d31aa 100644
  		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 diff --git a/incremental_mutation.go b/incremental_mutation.go
 new file mode 100644
-index 0000000..b372cb1
+index 0000000..c48c5b3
 --- /dev/null
 +++ b/incremental_mutation.go
-@@ -0,0 +1,1908 @@
+@@ -0,0 +1,1976 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -2240,6 +2335,66 @@ index 0000000..b372cb1
 +//
 +// Callers should treat ErrFallbackToFullBuild(err)==true as "do a full build",
 +// not a failure.
++// propagatingDependencyTag is implemented by a dependency tag whose DEPENDENT module
++// derives its own mutated properties from the DEPENDENCY's properties -- Soong's
++// `defaults` is the canonical case: a module with `defaults: ["D"]` has D's properties
++// merged into its own during mutation. A warm edit to D therefore changes the merged
++// properties of every such dependent, even though the dependent's own Blueprints text did
++// not change, so the dependent must be re-mutated too. A tag that does not implement this
++// (a normal link/data dep) does not propagate: the dependent only reads the dependency's
++// PROVIDERS at generate time, which the interfaceChanged propagation already handles.
++type propagatingDependencyTag interface {
++	PropagatesPropertyChanges() bool
++}
++
++func tagPropagatesProperties(tag DependencyTag) bool {
++	p, ok := tag.(propagatingDependencyTag)
++	return ok && p.PropagatesPropertyChanges()
++}
++
++// expandPropagatingConsumers returns changedNames plus the transitive set of module
++// group names that depend on a changed module through a property-propagating tag
++// (Soong defaults). Editing a `java_defaults` changes the merged properties of its
++// consumers, so they must re-mutate to pick up the new value; relying on the re-parse
++// property hash to flag them is unsound (their own parsed text is unchanged, and that
++// hash is non-deterministic for some modules -- the source of nondeterministic edit
++// misses). Following ONLY propagating edges keeps the closure to the defaults-consumer
++// set: a defaults module's reverse-deps are its consumers, not the much larger set of
++// modules that link the libraries those consumers build, so the result stays O(edit).
++// Deterministic: the returned list is sorted.
++func (c *Context) expandPropagatingConsumers(changedNames []string) []string {
++	inClosure := make(map[*moduleGroup]bool, len(changedNames))
++	var queue []*moduleGroup
++	enqueue := func(g *moduleGroup) {
++		if g != nil && !inClosure[g] {
++			inClosure[g] = true
++			queue = append(queue, g)
++		}
++	}
++	for _, name := range changedNames {
++		enqueue(c.moduleGroupFromName(name, nil))
++	}
++	// BFS over reverse-dep edges, following only property-propagating tags.
++	for i := 0; i < len(queue); i++ {
++		for _, m := range queue[i].modules {
++			for _, rm := range m.reverseDeps {
++				for _, dep := range rm.directDeps {
++					if dep.module == m && tagPropagatesProperties(dep.tag) {
++						enqueue(rm.group)
++						break
++					}
++				}
++			}
++		}
++	}
++	out := make([]string, 0, len(inClosure))
++	for g := range inClosure {
++		out = append(out, g.name)
++	}
++	sort.Strings(out)
++	return out
++}
++
 +func (c *Context) ReMutate(config interface{}, reparsedPropsByName map[string][]interface{}) (errs []error) {
 +	if c.incMutation == nil {
 +		return []error{fmt.Errorf("ReMutate: no resident baseline; call SnapshotPreMutationState first")}
@@ -2294,11 +2449,19 @@ index 0000000..b372cb1
 +		}
 +	}
 +
++	// Only the edited modules get new baseline properties (their Blueprints text changed).
 +	for _, name := range changedNames {
 +		if err := c.SetBaselineProperties(name, reparsedPropsByName[name]); err != nil {
 +			return []error{err}
 +		}
 +	}
++
++	// Re-mutate the edited modules AND every module that derives its properties from one
++	// of them via a property-propagating dep (Soong defaults consumers). The consumers
++	// re-mutate from their own (unchanged) baseline; re-running their mutators re-merges
++	// the edited defaults' new properties, which is what makes the edit correct -- and
++	// deterministic, instead of riding on a flaky re-parse hash.
++	remutateNames := c.expandPropagatingConsumers(changedNames)
 +
 +	// Apply the chosen strategy. If incremental re-mutation hits any error (e.g. an
 +	// added dependency that cannot be resolved on the variantized graph -- a
@@ -2308,12 +2471,12 @@ index 0000000..b372cb1
 +	var rerrs []error
 +	switch {
 +	case !hasTransition:
-+		rerrs = c.ReMutateModules(config, changedNames)
++		rerrs = c.ReMutateModules(config, remutateNames)
 +	case structureNeutral:
-+		rerrs = c.ReMutateModulesInPlace(config, changedNames)
++		rerrs = c.ReMutateModulesInPlace(config, remutateNames)
 +	default:
 +		// The edit changed a module's variant set: surgically add/remove variants.
-+		rerrs = c.ReMutateModulesStructural(config, changedNames)
++		rerrs = c.ReMutateModulesStructural(config, remutateNames)
 +	}
 +	if len(rerrs) > 0 {
 +		fmt.Fprintf(os.Stderr, "ReMutate: re-mutate strategy error -> fallback: %v\n", rerrs[0])
@@ -4720,10 +4883,10 @@ index 0000000..71a60b0
 +}
 diff --git a/incremental_ninja.go b/incremental_ninja.go
 new file mode 100644
-index 0000000..017c8e5
+index 0000000..7e30de8
 --- /dev/null
 +++ b/incremental_ninja.go
-@@ -0,0 +1,1179 @@
+@@ -0,0 +1,1271 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5198,42 +5361,69 @@ index 0000000..017c8e5
 +		add(m)
 +	}
 +
-+	for len(ready) > 0 {
-+		m := ready[len(ready)-1]
-+		ready = ready[:len(ready)-1]
-+		if done[m] || remaining[m] > 0 {
-+			// Stale ready entry: a dependency became affected after m was queued.
-+			continue
-+		}
-+		// A propagated (not pre-reset) module must be reset before regenerating; a
-+		// dirty (re-mutated) module was already reset by re-mutation.
-+		if !c.dirtyModules[m] {
-+			c.resetModuleBuildActions(m)
-+		}
-+		nd, es := c.generateOneModule(config, m, liveGlobals)
-+		deps = append(deps, nd...)
-+		if len(es) > 0 {
-+			errs = append(errs, es...)
-+			break
-+		}
-+		done[m] = true
-+		// Unblock affected reverse-deps that were waiting on m.
-+		for _, rd := range m.reverseDeps {
-+			if inAffected[rd] && !done[rd] {
-+				remaining[rd]--
-+				if remaining[rd] == 0 {
-+					ready = append(ready, rd)
++	// Process the affected worklist in PARALLEL: ready modules (all their affected deps
++	// done) are independent, so they generate concurrently -- bounded by parallelVisitLimit,
++	// exactly like the cold build's parallelVisit. The topological bookkeeping (remaining
++	// counts, interface-change propagation via add()) is serialized under mu; only the
++	// expensive generateOneModule runs outside it. generateOneModule is concurrency-safe
++	// (it locks liveGlobals), and resetModuleBuildActions + generate touch only their own,
++	// exclusively-owned module, so the result is byte-identical to the cold parallel
++	// generate. This overlaps the few heavy modules a central edit regenerates (e.g. the
++	// framework-minus-apex family) instead of summing their times serially.
++	var mu sync.Mutex
++	cond := sync.NewCond(&mu)
++	active := 0
++	var launch func()
++	launch = func() { // caller holds mu
++		for len(ready) > 0 && active < parallelVisitLimit {
++			m := ready[len(ready)-1]
++			ready = ready[:len(ready)-1]
++			if done[m] || remaining[m] > 0 {
++				// Stale ready entry: a dependency became affected after m was queued.
++				continue
++			}
++			active++
++			go func(m *moduleInfo) {
++				// A propagated (not pre-reset) module must be reset before regenerating; a
++				// dirty (re-mutated) module was already reset by re-mutation. Reset touches
++				// only m, which this worker exclusively owns.
++				if !c.dirtyModules[m] {
++					c.resetModuleBuildActions(m)
 +				}
-+			}
-+		}
-+		// If m's interface changed, its (other) reverse-deps must regenerate too.
-+		// m is already done, so add() won't miscount it.
-+		if m.interfaceChanged {
-+			for _, rd := range m.reverseDeps {
-+				add(rd)
-+			}
++				nd, es := c.generateOneModule(config, m, liveGlobals)
++				mu.Lock()
++				deps = append(deps, nd...)
++				errs = append(errs, es...)
++				done[m] = true
++				// Unblock affected reverse-deps that were waiting on m.
++				for _, rd := range m.reverseDeps {
++					if inAffected[rd] && !done[rd] {
++						remaining[rd]--
++						if remaining[rd] == 0 {
++							ready = append(ready, rd)
++						}
++					}
++				}
++				// If m's interface changed, its (other) reverse-deps must regenerate too.
++				// m is already done, so add() won't miscount it.
++				if m.interfaceChanged {
++					for _, rd := range m.reverseDeps {
++						add(rd)
++					}
++				}
++				active--
++				launch()
++				cond.Broadcast()
++				mu.Unlock()
++			}(m)
 +		}
 +	}
++	mu.Lock()
++	launch()
++	for active > 0 {
++		cond.Wait()
++	}
++	mu.Unlock()
 +
 +	// Fold ONLY the regenerated modules' new interfaces back into the resident
 +	// baseline (O(affected), not the O(tree) commitInterfaceHashes over all
@@ -5751,32 +5941,88 @@ index 0000000..017c8e5
 +// an order-only dep -- the common case for a no-op add such as a cc_defaults -- no count
 +// changed, the decision is unchanged, every clean module's emitted order-only is still
 +// correct, and the cached phonys are byte-exact.
++// emptyOrderOnlyFingerprint is moduleOrderOnlyFingerprint of a module that emits no
++// order-only dep -- the FNV-1a offset basis (the hash of zero bytes).
++const emptyOrderOnlyFingerprint = uint64(14695981039346656037)
++
++// moduleOrderOnlyFingerprint hashes a module's order-only key SET across its build defs
++// (from the immutable OrderOnlyOriginal). It changes iff the module adds or drops a use of
++// some order-only key -- exactly what can shift a dedup count -- and is stable for a module
++// whose order-only deps are unchanged, even if other properties (e.g. a javacFlags
++// variable) changed.
++func moduleOrderOnlyFingerprint(m *moduleInfo) uint64 {
++	h := fnv.New64a()
++	for _, def := range m.actionDefs.buildDefs {
++		if def.OrderOnlyOriginal.Len() == 0 {
++			continue
++		}
++		for _, s := range def.OrderOnlyOriginal.ToSlice() {
++			h.Write([]byte(s))
++			h.Write([]byte{0})
++		}
++		h.Write([]byte{1}) // def separator
++	}
++	return h.Sum64()
++}
++
 +func (c *Context) orderOnlyDedupReusable() bool {
-+	if c.dirtyModules == nil || c.genuinelyChangedModules == nil ||
-+		c.cachedOrderOnlyPhonys == nil {
++	if c.dirtyModules == nil || c.cachedOrderOnlyPhonys == nil ||
++		c.cachedDedupNames == nil || c.orderOnlyFingerprints == nil {
 +		return false
 +	}
-+	// A genuinely-changed or added module that emits an order-only dep can change a key's
-+	// use count, so the dedup decision (and the cached phonys) must be recomputed.
-+	for m := range c.genuinelyChangedModules {
-+		for _, def := range m.actionDefs.buildDefs {
-+			if def.OrderOnlyOriginal.Len() > 0 {
++	added := make(map[*moduleInfo]bool, len(c.incrementalAddedModules))
++	for _, m := range c.incrementalAddedModules {
++		added[m] = true
++	}
++	// A regenerated module whose order-only key set changed -- or an ADDED module that
++	// introduces any order-only dep -- shifts a key's use count, so the dedup decision may
++	// change and must be recomputed. A regenerated module whose key set is unchanged
++	// (fingerprint matches last build) keeps every count, so the decision is still exact
++	// and its fresh defs just need remapping with the cached dedup names.
++	for m := range c.regeneratedModules {
++		fp := moduleOrderOnlyFingerprint(m)
++		if added[m] {
++			if fp != emptyOrderOnlyFingerprint {
 +				return false
 +			}
++		} else if fp != c.orderOnlyFingerprints[m] {
++			return false
 +		}
 +	}
-+	// Likewise a REMOVED module that emitted an order-only dep drops a use of that key,
-+	// which can flip a shared key below the dedup threshold. If no removed module emitted
-+	// one, no count changed and the cached phonys are still byte-exact. (incrementalRemoved-
-+	// Modules retains last build's actionDefs even though the module is detached.)
++	// A REMOVED module that emitted an order-only dep drops a use of that key, which can
++	// flip a shared key below the dedup threshold. (incrementalRemovedModules retains last
++	// build's actionDefs even though the module is detached from the graph.)
 +	for _, m := range c.incrementalRemovedModules {
-+		for _, def := range m.actionDefs.buildDefs {
-+			if def.OrderOnlyOriginal.Len() > 0 {
-+				return false
-+			}
++		if moduleOrderOnlyFingerprint(m) != emptyOrderOnlyFingerprint {
++			return false
 +		}
 +	}
 +	return true
++}
++
++// remapRegeneratedOrderOnly rewrites each regenerated module's fresh build defs to use the
++// cached dedup names, exactly as the full recompute's per-module pass does -- but only over
++// the regenerated modules (O(edit)), since clean modules kept their already-correct emitted
++// order-only across the rebuild. Used by the reuse fast path when the dedup decision is
++// unchanged (orderOnlyDedupReusable).
++func (c *Context) remapRegeneratedOrderOnly() {
++	for m := range c.regeneratedModules {
++		if len(m.actionDefs.buildDefs) == 0 {
++			continue
++		}
++		m.orderOnlyStrings = m.orderOnlyStrings[:0]
++		for _, def := range m.actionDefs.buildDefs {
++			if def.OrderOnlyOriginal.Len() == 0 {
++				continue
++			}
++			if name, ok := c.cachedDedupNames[def.OrderOnlyOriginal]; ok {
++				def.OrderOnlyStrings = uniquelist.Make([]string{name})
++				m.orderOnlyStrings = append(m.orderOnlyStrings, name)
++			} else {
++				def.OrderOnlyStrings = def.OrderOnlyOriginal
++			}
++		}
++	}
 +}
 +
 +// deduplicateOrderOnlyDepsResident recomputes the order-only dedup decision
@@ -5789,10 +6035,12 @@ index 0000000..017c8e5
 +// resolved graph" invariant applied to order-only dedup.
 +func (c *Context) deduplicateOrderOnlyDepsResident(modules []*moduleInfo) *localBuildActions {
 +	if c.orderOnlyDedupReusable() {
-+		// No genuinely-changed module contributed an order-only dep, so no key's use
-+		// count changed: the dedup decision, every clean module's already-correct
-+		// emitted order-only, and the phony set are all unchanged. Reuse the cached
-+		// phonys and skip the O(tree) recount + per-module rewrite.
++		// No regenerated/added/removed module changed its order-only key set, so no key's
++		// use count changed: the dedup decision and the phony set are unchanged, and every
++		// clean module's emitted order-only is still correct. Reuse the cached phonys and
++		// remap only the regenerated modules' fresh defs -- skipping the O(tree) recount +
++		// all-module rewrite.
++		c.remapRegeneratedOrderOnly()
 +		return c.cachedOrderOnlyPhonys
 +	}
 +	type keyInfo struct {
@@ -5810,7 +6058,11 @@ index 0000000..017c8e5
 +		ki.incremental = ki.incremental || incremental
 +	}
 +	prevCache := c.orderOnlyStringsCache
++	// Record each module's order-only fingerprint as the baseline for the next warm
++	// rebuild's reuse test (orderOnlyDedupReusable).
++	c.orderOnlyFingerprints = make(map[*moduleInfo]uint64, len(modules))
 +	for _, m := range modules {
++		c.orderOnlyFingerprints[m] = moduleOrderOnlyFingerprint(m)
 +		if len(m.actionDefs.buildDefs) == 0 {
 +			// Restored module (on-disk incremental): it kept its emitted order-only
 +			// (dedup names) but has no live defs; count its cached originals so a
@@ -5832,6 +6084,9 @@ index 0000000..017c8e5
 +
 +	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
 +	dedupName := map[uniquelist.UniqueList[string]]string{}
++	// Cache the dedup decision so a later warm rebuild that changes no order-only key set
++	// can reuse it (orderOnlyDedupReusable) and remap only its regenerated modules.
++	c.cachedDedupNames = dedupName
 +	var phonys []*buildDef
 +	for key, ki := range counts {
 +		if ki.count < 2 {

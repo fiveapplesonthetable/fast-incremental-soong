@@ -4,15 +4,25 @@ Make AOSP's analysis phase incremental: edit one `Android.bp`, regenerate
 `build.ninja` in seconds instead of re-analyzing the whole tree — **byte-identical
 to a clean build**, measured on real AOSP.
 
-> **Status (checkpoint `v0.7s`):** a `frameworks/base/Android.bp` **add** and
-> **remove** now regenerate+write in **~0.77 s** (from ~24 s), all 1067 ninja+mk
-> shards byte-identical to a cold resident rebuild, on the warm path (no fallback),
-> clean exit. The last ~3.7 s came from two caches: the resident order-only dedup
-> result, and a per-singleton serialized-block cache — the singletons subninja
-> (~40 % of the manifest) was being re-serialized every build just to hash-check it
-> was unchanged (now <1 ms). A property **edit** is byte-identical but not yet
-> sub-second (~4.5 s) and exposes a pre-existing nondeterministic propagation gap
-> for `java_defaults` consumers. See `patches/SUMMARY.md` for the breakdown.
+> **Status (checkpoint `v0.8`):** all three warm `frameworks/base/Android.bp` edit
+> classes are byte-identical to a cold resident rebuild (all 1067 ninja+mk shards),
+> on the warm path (no fallback), clean exit:
+>
+> | edit | regenerate+write | from |
+> |---|--:|--:|
+> | **add** a module | **~0.71 s** | ~24 s |
+> | **remove** a module | **~0.73 s** | ~24 s |
+> | **property edit** (worst case: `framework-minus-apex-defaults`) | **~1.27 s** | ~4.5 s |
+>
+> Add/remove are sub-second. The property edit shown is the *worst case* — editing
+> the defaults for the entire framework jar — and its residual ~1.27 s is intrinsic:
+> reparse the large `Android.bp` (~0.4 s) + **regenerate the framework jar's analysis**
+> (the heavy `framework-minus-apex` modules, ~0.6 s even parallelized) + rewrite the
+> ~18 manifest shards that changed (~0.3 s). A leaf edit pays only the reparse + a tiny
+> generate and is sub-second. The edit was also made *deterministically* byte-identical
+> (it previously depended on a flaky re-parse hash to re-mutate `java_defaults`
+> consumers; now a propagating-dependency-tag closure does it for sure). See
+> `patches/SUMMARY.md` for the per-fix breakdown.
 
 ## What it does
 

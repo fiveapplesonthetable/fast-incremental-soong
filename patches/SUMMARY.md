@@ -7,7 +7,46 @@ soong-only, `m nothing`), edit on **`frameworks/base/Android.bp`** (the realisti
 worst case). Every warm result was verified `cmp`-identical to a cold resident
 rebuild of the same edited tree (every ninja + `.mk` shard).
 
-## v0.7s — sub-second add/remove (latest)
+## v0.8 — warm property edit O(edit), and deterministic (latest)
+
+A warm property edit is now byte-identical to a cold resident rebuild **on every
+run**, and O(edit). The worst case -- editing `framework-minus-apex-defaults`, the
+`java_defaults` for the entire framework jar -- went from **4.5 s to ~1.27 s**
+regenerate+write (1067 shards, differing=0); a leaf edit is sub-second.
+
+**Correctness (the important fix).** A `java_defaults` edit changes the MERGED
+properties of every module that lists it in `defaults:`, even though those consumers'
+own Blueprints text is unchanged. The re-mutation only re-ran the edited module, so
+consumers kept stale merged properties -- they were re-mutated (and picked up the new
+value) only when a non-deterministic re-parse property hash happened to flag them,
+making the edit byte-identical only ~2 runs in 3. Fix: a dependency tag can declare
+`PropagatesPropertyChanges()` (Soong's `DefaultsDepTag` does), and the warm
+re-mutation expands the changed set to the transitive reverse-dep closure over those
+tags. Following only propagating edges keeps the closure to the defaults-consumer set
+(a defaults module's reverse-deps are its consumers, not the libraries that link what
+they build), so it stays O(edit). Byte-identical on 3/3 runs.
+
+**Speed (4.5 s -> ~1.27 s).** Three O(edit) caches, all gated behind
+`residentNinjaLayout()`:
+1. **Sound order-only fingerprint dedup cache.** The dedup recomputed over the whole
+   tree (and re-serialized the phonys subninja) every edit. Cache the dedup decision +
+   each module's order-only key-set fingerprint; reuse it when no regenerated module
+   changed its order-only key set, and remap only the regenerated modules. The
+   fingerprint -- not the tolerant provider hash -- is the sound edit test. dedup
+   1.1 s -> 1 ms.
+2. **Parallel targeted generate.** The affected modules regenerated serially, so an
+   edit touching a few heavy modules paid the sum. Generate the affected worklist in
+   parallel (bounded, like the cold build's parallelVisit). generate 1.1 s -> ~0.63 s.
+3. **Cached sorted+sharded module lists.** A non-membership edit has a pointer-
+   identical module set, so reuse last build's sort order + content-addressed shard
+   assignment instead of re-sorting+re-hashing the tree. writeAllModuleActions
+   0.79 s -> ~0.59 s.
+
+The residual ~1.27 s is intrinsic to a framework-wide edit (reparse ~0.4 s +
+regenerate the framework jar's analysis ~0.6 s + rewrite the ~18 changed shards
+~0.3 s) -- no cache can skip producing output that actually changed.
+
+## v0.7s — sub-second add/remove
 
 A `frameworks/base/Android.bp` **add** (763 ms) and **remove** (773 ms) now
 regenerate+write in **~0.77 s** (from ~24 s cold, ~4.5 s at the previous

@@ -1085,6 +1085,9 @@ soong analysis, in the daemon:
                           incremental-modules subninja is sharded the same way);
                           the rest are left on disk untouched.
   total          ~4.4 s   byte-identical to a cold rebuild.
+                          (v0.8: now ~0.71s add / ~0.73s remove / ~1.27s edit --
+                          the dedup, singleton and sort/shard recomputes that
+                          dominated this number are now O(edit) caches; see ch. 58.)
 
 ninja: ~5.1 s. Stock ninja keeps no state between runs, so it re-parses the
   whole 5.6 GB manifest into RAM, finds nothing to do, and exits.
@@ -1899,6 +1902,35 @@ property edit, add-module, and remove-module, each with an O(edit) manifest writ
 The remaining work to single-digit is finishing the incremental singleton emit
 (phony done; androidmk next) and the wall overhead -- dumpvars and the ninja
 manifest reload.
+
+**Update (v0.8): the soong-side regenerate+write is now sub-second to ~1.3s, not
+~4.4s.** Three things were re-serializing or recomputing over the whole tree on
+every warm build, none of which an edit actually changes: the order-only dedup
+(O(tree) recount + a re-serialize of the ~60%-of-manifest phonys subninja), the
+singletons subninja (~40% of the manifest, re-serialized just to hash-check it was
+unchanged), and the sorted+content-addressed-sharded module lists. Cache each, keyed
+on what genuinely changed (a per-module order-only *fingerprint* for the dedup; the
+probe-kept set for singletons; pointer-identity of the module set for the sort/shard
+layout), and they collapse to O(edit): dedup 1.1s→1ms, singletons 0.9s→<1ms, sort+
+shard 0.4s→0ms. The targeted generate, which had been serial, now regenerates the
+affected modules in parallel like the cold build (a central edit's few heavy modules
+overlap instead of summing). Net on real AOSP, regenerate+write: **add ~0.71s,
+remove ~0.73s, property edit ~1.27s** (the worst case shown is editing
+`framework-minus-apex-defaults`, the defaults for the entire framework jar; a leaf
+edit is sub-second). The property edit's residual ~1.27s is intrinsic — reparse the
+large `Android.bp`, regenerate the framework jar's analysis, rewrite the ~18 shards
+that changed — not overhead.
+
+That edit was also made *deterministically* byte-identical. The earlier
+consumer-regeneration fix (chapter 53) relied on the re-parse property hash flagging
+a `java_defaults`'s consumers as "changed"; that hash is non-deterministic for some
+modules, so the consumers were re-mutated (and picked up the edited defaults) only
+~2 runs in 3. The fix generalizes chapter 53's "Fix 4": a dependency tag can declare
+`PropagatesPropertyChanges()` — Soong's `DefaultsDepTag` does — and the warm
+re-mutation expands the changed set to the transitive reverse-dep closure over those
+tags, so every defaults consumer re-mutates for sure, independent of the hash. The
+closure follows only propagating edges, so it stays the defaults-consumer set, not
+the whole reverse-dep graph.
 
 ## 59. File-scoped reparse
 
