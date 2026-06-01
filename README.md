@@ -4,12 +4,15 @@ Make AOSP's analysis phase incremental: edit one `Android.bp`, regenerate
 `build.ninja` in seconds instead of re-analyzing the whole tree — **byte-identical
 to a clean build**, measured on real AOSP.
 
-> **Status (checkpoint `v0.6.2s`):** a `frameworks/base/Android.bp` add now
-> regenerates+writes in **~6.2 s** (from ~24 s), 467/467 ninja shards byte-identical
-> to a cold resident rebuild. A property edit is well under a second. Sub-second on
-> add/remove is the next target; the remaining floor is the singleton contribution
-> probe (~2.5 s, GC-bound) which needs a per-singleton input-declaration redesign,
-> not tuning. See `patches/SUMMARY.md` for the full breakdown.
+> **Status (checkpoint `v0.7s`):** a `frameworks/base/Android.bp` **add** and
+> **remove** now regenerate+write in **~0.77 s** (from ~24 s), all 1067 ninja+mk
+> shards byte-identical to a cold resident rebuild, on the warm path (no fallback),
+> clean exit. The last ~3.7 s came from two caches: the resident order-only dedup
+> result, and a per-singleton serialized-block cache — the singletons subninja
+> (~40 % of the manifest) was being re-serialized every build just to hash-check it
+> was unchanged (now <1 ms). A property **edit** is byte-identical but not yet
+> sub-second (~4.5 s) and exposes a pre-existing nondeterministic propagation gap
+> for `java_defaults` consumers. See `patches/SUMMARY.md` for the breakdown.
 
 ## What it does
 

@@ -7,6 +7,36 @@ soong-only, `m nothing`), edit on **`frameworks/base/Android.bp`** (the realisti
 worst case). Every warm result was verified `cmp`-identical to a cold resident
 rebuild of the same edited tree (every ninja + `.mk` shard).
 
+## v0.7s — sub-second add/remove (latest)
+
+A `frameworks/base/Android.bp` **add** (763 ms) and **remove** (773 ms) now
+regenerate+write in **~0.77 s** (from ~24 s cold, ~4.5 s at the previous
+checkpoint), all 1067 ninja+`.mk` shards byte-identical to a cold resident rebuild,
+on the warm path (`REUSING`, no fallback), with a clean (exit 0) client. The last
+~3.7 s came from two caches, both gated behind `residentNinjaLayout()`:
+
+1. **Resident order-only dedup cache.** `cachedOrderOnlyPhonys` was only assigned on
+   the *Stock* dedup path, which the resident daemon never takes — so a warm rebuild
+   recomputed the order-only dedup over the whole tree and re-serialized the phonys
+   subninja every build. Caching it on the resident path lets a no-op add/remove
+   reuse it (skip the O(tree) recount + the phonys write).
+2. **Per-singleton serialized-block cache.** The singletons subninja (~40 % of the
+   manifest) was re-serialized in full just to hash-check it was unchanged (~0.9 s).
+   Caching each singleton's serialized block and re-serializing only the few that
+   re-ran (in practice just `bootstrap`) cuts that to **<1 ms**.
+3. **Contribution probe over removed modules.** A removed module keeps its
+   `logicModule`+providers, so the probe runs singletons over it (the subtraction
+   analogue of the add probe) — remove now keeps its singletons via the block cache
+   too, instead of re-serializing all of them.
+
+A property **edit** is byte-identical but **not yet sub-second (~4.5 s)** and exposes
+a *pre-existing, nondeterministic* propagation gap: editing a `java_defaults` module
+occasionally fails to regenerate some of its consumer variants (e.g.
+`framework-minus-apex-intdefs/-headers`), so warm vs cold differs on ~2/1067 shards
+on roughly 1 run in 3. This is the deep variant-propagation-completeness problem the
+content-addressed-query redesign targets; the edit speed-up (same two caches) is held
+behind fixing it, since speeding up a sometimes-wrong output is not worth shipping.
+
 ## Enabling
 
 One environment variable on an otherwise-normal build:

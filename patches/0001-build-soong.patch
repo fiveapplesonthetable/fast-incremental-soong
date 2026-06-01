@@ -1,3 +1,16 @@
+diff --git a/android/container_violations.go b/android/container_violations.go
+index b6e20fe46..0172cf4a5 100644
+--- a/android/container_violations.go
++++ b/android/container_violations.go
+@@ -1400,7 +1400,7 @@ var ContainerDependencyViolationAllowlist = map[string][]string{
+ 		"framework", // cts -> unstable
+ 	},
+ 
+-	"StableNetHttpCoverageTests": {
++	"stable_cronet_NetHttpCoverageTests": {
+ 		"framework", // cts -> unstable
+ 	},
+ 
 diff --git a/android/namespace.go b/android/namespace.go
 index 7d2ace2ca..17dcf9252 100644
 --- a/android/namespace.go
@@ -23,7 +36,7 @@ index 7d2ace2ca..17dcf9252 100644
  	r.rootNamespace.moduleContainer.NewSkippedModule(ctx, name, skipInfo)
  }
 diff --git a/android/phony.go b/android/phony.go
-index 105477a05..d4950b046 100644
+index 105477a05..fc46ccc88 100644
 --- a/android/phony.go
 +++ b/android/phony.go
 @@ -16,6 +16,7 @@ package android
@@ -34,7 +47,7 @@ index 105477a05..d4950b046 100644
  	"runtime"
  	"sort"
  	"strings"
-@@ -42,106 +43,360 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
+@@ -42,106 +43,374 @@ var SingletonPhonyProvider = blueprint.NewSingletonProvider[PhonyInfo]()
  type phonySingleton struct {
  	phonyMap  phonyMap
  	phonyList []string
@@ -64,6 +77,20 @@ index 105477a05..d4950b046 100644
 -			for k, v := range info.Phonies {
 -				p.phonyMap[k] = append(p.phonyMap[k], v...)
 -			}
++// IncrementalGatingProviders lets the blueprint incremental layer decide this
++// singleton from the changed modules' providers instead of running it. phony's output
++// over a given module set is its modules' ModulePhonyProvider phonies plus every other
++// singleton's SingletonPhonyProvider phonies; the latter are independent of which
++// modules are added, so the only way a changed MODULE affects phony's output is by
++// setting ModulePhonyProvider. A warm add whose changed modules set none of it cannot
++// change phony's module contribution -- the same decision the run-based probe reaches,
++// but without phony's O(tree) singleton re-aggregation (the dominant probe cost). The
++// singleton-phony dependency is handled exactly as before (a re-run singleton that
++// changes its phonies is the caller's concern, and is policed by the byte gate).
++func (p *phonySingleton) IncrementalGatingProviders() []blueprint.AnyProviderKey {
++	return []blueprint.AnyProviderKey{ModulePhonyProvider}
++}
++
 +// phonyMkShards is the number of files the soong-only phony makefile is sharded
 +// into (soong_phony_targets.N.mk). A stable hash of each phony key picks its shard,
 +// so a warm add rewrites only the shards whose keys changed instead of the whole
@@ -92,7 +119,7 @@ index 105477a05..d4950b046 100644
 +	}
 +	return true
 +}
-+
+ 
 +// samePathsSet reports whether two Paths have the same UNIQUE set of elements,
 +// ignoring order AND duplicate count. The merged manifest runs SortedUniquePaths on
 +// each key, so two contributions with the same unique set produce byte-identical
@@ -140,7 +167,7 @@ index 105477a05..d4950b046 100644
 +	// so only those are rebuilt and rewritten; the rest are kept on disk. On a full
 +	// build every shard is (re)written.
 +	touchedShards := map[int]bool{}
- 
++
 +	// Singletons are few, so always recompute their phony contributions fresh. This is
 +	// what makes the pure-add fold below correct across a membership change: a singleton
 +	// that aggregates over all modules (all_teams, sbom, owners, test_mapping, ...) can
@@ -332,7 +359,10 @@ index 105477a05..d4950b046 100644
 +			p.phonyMap[k] = append(p.phonyMap[k], v...)
 +		}
 +		p.singletonPhonyMap = singletonPhonies
-+
+ 
+-	sortChan := make(chan phonyDef, len(p.phonyMap))
+-	resultsChan := make(chan phonyDef)
+-	var wg sync.WaitGroup
 +		// We will sort phonyList in parallel with other stuff later, but for now copy it
 +		// into a slice in series so that we don't read and write to phonyMap concurrently.
 +		p.phonyList = make([]string, 0, len(p.phonyMap))
@@ -344,10 +374,7 @@ index 105477a05..d4950b046 100644
 +			name string
 +			deps Paths
 +		}
- 
--	sortChan := make(chan phonyDef, len(p.phonyMap))
--	resultsChan := make(chan phonyDef)
--	var wg sync.WaitGroup
++
 +		sortChan := make(chan phonyDef, len(p.phonyMap))
 +		resultsChan := make(chan phonyDef)
 +		var wg sync.WaitGroup

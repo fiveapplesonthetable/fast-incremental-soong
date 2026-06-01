@@ -159,7 +159,7 @@ index 0dd99c6..4d6a0ae 100644
  
  type PrimaryBuilderInvocation struct {
 diff --git a/context.go b/context.go
-index 199171c..85de246 100644
+index 199171c..fb23dd9 100644
 --- a/context.go
 +++ b/context.go
 @@ -19,11 +19,9 @@ import (
@@ -223,7 +223,7 @@ index 199171c..85de246 100644
  	buildActionsCache       *BuildActionCache
  	buildActionsToCacheLock sync.Mutex
  	orderOnlyStringsCache   OrderOnlyStringsCache
-@@ -190,6 +223,105 @@ type Context struct {
+@@ -190,6 +223,135 @@ type Context struct {
  	EncContext              gobtools.EncContext
  	providerValueHashes     []uint64
  
@@ -260,6 +260,14 @@ index 199171c..85de246 100644
 +	// removed module's contribution from its cached aggregate without rescanning the
 +	// tree. Reset by BeginIncrementalBuild.
 +	incrementalRemovedKeys []string
++
++	// incrementalRemovedModules is the detached moduleInfo of each module removed this
++	// build. A removed module is spliced out of the graph but still carries its logicModule,
++	// providers, and last-build actionDefs, so the singleton contribution probe can run a
++	// singleton over it (probeRestrict) to decide whether removing it changes that
++	// singleton's output, and the order-only dedup can check whether it emitted an
++	// order-only dep. Reset by BeginIncrementalBuild.
++	incrementalRemovedModules []*moduleInfo
 +
 +	// forcedDirtyShards is the set of ninja shard indices that the delta write must
 +	// rewrite even though none of their CURRENT modules is dirty. Set by
@@ -319,6 +327,28 @@ index 199171c..85de246 100644
 +	// usually is once the contribution probe has kept all but a few singletons.
 +	singletonsHash uint64
 +
++	// singletonsRestoredAll is set by generateSingletonBuildActions on a membership
++	// rebuild: true when the contribution probe kept EVERY singleton's resident
++	// actionDefs (none re-ran), so the singletons subninja is byte-identical to the
++	// previous build. writeSingletonsSubninja uses it to skip serializing+hashing that
++	// whole section -- the cheap-skip the membershipChanged guard would otherwise miss.
++	singletonsRestoredAll bool
++
++	// restorableSingletonNames is the set of singleton names whose resident actionDefs
++	// the contribution probe kept (did not re-run) on this membership rebuild. Their
++	// serialized subninja block is byte-identical to the previous build, so
++	// writeSingletonsSubninja reuses the cached block (singletonBlockBytes) instead of
++	// re-serializing it. Set by generateSingletonBuildActions; only meaningful on a
++	// membership rebuild (a stable-set rebuild keeps all singletons via singletonsNeedRegen).
++	restorableSingletonNames map[string]bool
++
++	// singletonBlockBytes caches each singleton's serialized subninja block (its header
++	// comment + local build actions, exactly as writeAllSingletonActions emits it) from
++	// the last build that wrote the singletons subninja. A warm membership rebuild reuses
++	// the cached block for every restored singleton and re-serializes only the few that
++	// re-ran (e.g. bootstrap), turning the O(all-singletons) serialize into O(re-ran).
++	singletonBlockBytes map[string][]byte
++
 +	// cachedOrderOnlyPhonys is the order-only-dep dedup result (the phony build defs)
 +	// from the last build. deduplicateOrderOnlyDepsResident reuses it -- skipping the
 +	// O(tree) recount and per-module rewrite -- when no genuinely-changed module
@@ -329,7 +359,7 @@ index 199171c..85de246 100644
  	moduleDebugDataChannel chan []byte
  
  	captureBuildParams bool
-@@ -361,6 +493,21 @@ type moduleInfo struct {
+@@ -361,6 +523,21 @@ type moduleInfo struct {
  	group       *moduleGroup
  	properties  []interface{}
  
@@ -351,7 +381,7 @@ index 199171c..85de246 100644
  	// set during ResolveDependencies
  	missingDeps   []string
  	newDirectDeps []*moduleInfo
-@@ -412,6 +559,12 @@ type moduleInfo struct {
+@@ -412,6 +589,12 @@ type moduleInfo struct {
  	startedGenerateBuildActions  bool
  	finishedGenerateBuildActions bool
  
@@ -364,7 +394,7 @@ index 199171c..85de246 100644
  	// freeAfterGenerateBuildActions is set if the module called ModuleContext.FreeModuleAfterGenerateBuildActions,
  	// allowing the Module to be freed after GenerateBuildActions complete, and requiring all future accesses
  	// to go through ModuleProxy instead of the Module.
-@@ -788,10 +941,6 @@ func (c *Context) GetIncrementalEnabled() bool {
+@@ -788,10 +971,6 @@ func (c *Context) GetIncrementalEnabled() bool {
  	return c.incrementalEnabled
  }
  
@@ -375,7 +405,7 @@ index 199171c..85de246 100644
  func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
  	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
  		return err
-@@ -2936,7 +3085,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2936,7 +3115,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
  		c.buildActionsReady = false
  
@@ -389,7 +419,7 @@ index 199171c..85de246 100644
  		// Add all the global rules/variable/pools here because when we restore from
  		// cache we don't have the build defs available to build the globals.
  		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
-@@ -2991,15 +3145,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -2991,15 +3175,28 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			deps = append(deps, extraDeps...)
  		}
  
@@ -421,7 +451,7 @@ index 199171c..85de246 100644
  
  		var depsSingletons []string
  		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
-@@ -3018,6 +3185,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
+@@ -3018,6 +3215,21 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
  			}
  		}
  
@@ -443,7 +473,7 @@ index 199171c..85de246 100644
  		pkgNames, depsPackages := c.makeUniquePackageNames(c.liveGlobals)
  
  		deps = append(deps, depsPackages...)
-@@ -3333,6 +3515,18 @@ func (c *Context) cloneModules() {
+@@ -3333,6 +3545,18 @@ func (c *Context) cloneModules() {
  		func(m *moduleInfo, pause pauseFunc) bool {
  			m.logicModule, m.properties = c.cloneLogicModule(m)
  			m.logicModule.setInfo(m)
@@ -462,7 +492,7 @@ index 199171c..85de246 100644
  			return false
  		})
  	if len(errs) > 0 {
-@@ -3371,6 +3565,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3371,6 +3595,20 @@ func (c *Context) generateModuleBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -483,7 +513,7 @@ index 199171c..85de246 100644
  	cancelCh := make(chan struct{})
  	errsCh := make(chan []error)
  	depsCh := make(chan []string)
-@@ -3392,93 +3600,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3392,93 +3630,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	visitErrs := parallelVisit(c.iterateAllVariants(), bottomUpVisitor, parallelVisitLimit,
  		func(module *moduleInfo, pause pauseFunc) bool {
@@ -581,7 +611,7 @@ index 199171c..85de246 100644
  			return false
  		})
  
-@@ -3487,6 +3614,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
+@@ -3487,6 +3644,10 @@ func (c *Context) generateModuleBuildActions(config interface{},
  
  	errs = append(errs, visitErrs...)
  
@@ -592,7 +622,7 @@ index 199171c..85de246 100644
  	return deps, errs
  }
  
-@@ -3597,8 +3728,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3597,8 +3758,11 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  			Id: info.name,
  		}
  		// We can pursue a incremental analysis because there is no soong coding change, no
@@ -606,7 +636,7 @@ index 199171c..85de246 100644
  			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
  			if err != nil {
  				panic(err)
-@@ -3620,7 +3754,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
+@@ -3620,7 +3784,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, b
  }
  
  func (c *Context) generateParallelSingletonBuildActions(config interface{},
@@ -616,7 +646,7 @@ index 199171c..85de246 100644
  
  	c.BeginEvent("generateParallelSingletonBuildActions")
  	defer c.EndEvent("generateParallelSingletonBuildActions")
-@@ -3654,6 +3789,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3654,6 +3819,10 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  			// Skip any singletons registered with parallel=false.
  			continue
  		}
@@ -627,7 +657,7 @@ index 199171c..85de246 100644
  		wg.Add(1)
  		go func(inf *singletonInfo) {
  			defer wg.Done()
-@@ -3670,33 +3809,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
+@@ -3670,33 +3839,52 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
  	return deps, errs
  }
  
@@ -699,7 +729,7 @@ index 199171c..85de246 100644
  }
  
  func (c *Context) generateSingletonBuildActions(config interface{},
-@@ -3708,8 +3866,92 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3708,8 +3896,113 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	var deps []string
  	var errs []error
  
@@ -738,11 +768,21 @@ index 199171c..85de246 100644
 +	// incremental_singleton_probe.go). Skipped singletons are neither reset nor re-run.
 +	var restorableSingleton map[*singletonInfo]bool
 +	if c.membershipChanged {
-+		// The contribution probe is sound only when nothing was removed (a removal
-+		// subtracts a contribution the probe, which runs over added+changed modules,
-+		// cannot see). With removals, fall back to resetting and re-running everything.
-+		if len(c.incrementalRemovedKeys) == 0 {
++		// Probe over the union of added/changed modules AND removed modules. A removed
++		// module is spliced out of the graph but still carries its logicModule and
++		// providers, so probing a singleton over it (probeRestrict) reveals whether
++		// removing it changes that singleton's output -- the subtraction analogue of the
++		// add probe, and exact for an additive singleton. Including removed modules makes
++		// the probe (and the gating fast-path, which checks every probe-set module's
++		// gating providers) sound for remove and mixed add+remove, not just add.
++		{
 +			probeSet := c.genuinelyChangedProbeSet()
++			probeSet = append(probeSet, c.incrementalRemovedModules...)
++			// Drop removed modules from the provider-hash baseline so a later re-add of the
++			// same module is correctly seen as new.
++			for _, m := range c.incrementalRemovedModules {
++				delete(c.residentProviderHashes, probeIdentity(m))
++			}
 +			if len(probeSet) > 0 {
 +				restorableSingleton = make(map[*singletonInfo]bool, len(singletons))
 +				// Probe each singleton in parallel: every probe runs in its own throwaway
@@ -782,6 +822,17 @@ index 199171c..85de246 100644
 +			info.startedGenerateBuildActions = false
 +			info.finishedGenerateBuildActions = false
 +		}
++		// If every singleton's resident actionDefs were kept (nothing re-ran), the
++		// singletons subninja is byte-identical to the previous build, so
++		// writeSingletonsSubninja can skip serializing+hashing the whole (~40% of the
++		// manifest) section -- the dominant remaining warm-rebuild write cost.
++		c.singletonsRestoredAll = len(restorableSingleton) == len(singletons)
++		// Record which singletons were kept so writeSingletonsSubninja can reuse their
++		// cached serialized blocks and re-serialize only the few that re-ran.
++		c.restorableSingletonNames = make(map[string]bool, len(restorableSingleton))
++		for info := range restorableSingleton {
++			c.restorableSingletonNames[info.name] = true
++		}
 +	}
 +
  	// Run one singleton.  Use a variable to simplify manual validation testing.
@@ -792,7 +843,7 @@ index 199171c..85de246 100644
  		c.BeginEvent("singleton:" + info.name)
  		defer c.EndEvent("singleton:" + info.name)
  		newDeps, newErrs := c.generateOneSingletonBuildActions(config, info, liveGlobals)
-@@ -3722,11 +3964,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
+@@ -3722,11 +4015,18 @@ func (c *Context) generateSingletonBuildActions(config interface{},
  	c.sortedModuleGroups()
  
  	if c.GetIncrementalEnabled() {
@@ -813,7 +864,7 @@ index 199171c..85de246 100644
  
  	for _, info := range singletons {
  		if !info.parallel {
-@@ -4596,7 +4845,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
+@@ -4596,7 +4896,16 @@ func (c *Context) WriteBuildFile(w StringWriterWriter, shardNinja bool, ninjaFil
  			return
  		}
  
@@ -831,7 +882,7 @@ index 199171c..85de246 100644
  			return
  		}
  	})
-@@ -4849,10 +5107,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
+@@ -4849,10 +5158,9 @@ func GetNinjaShardFiles(ninjaFile string) []string {
  		panic(fmt.Errorf("ninja file name in wrong format : %s", ninjaFile))
  	}
  	base := strings.TrimSuffix(ninjaFile, suffix)
@@ -844,7 +895,7 @@ index 199171c..85de246 100644
  		fileNames[i] = fmt.Sprintf("%s.%d%s", base, i, suffix)
  	}
  	return fileNames
-@@ -4900,7 +5157,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4900,7 +5208,14 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		})
  	})
  
@@ -860,7 +911,7 @@ index 199171c..85de246 100644
  		return err
  	}
  
-@@ -4914,9 +5178,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4914,9 +5229,40 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  		var wg sync.WaitGroup
  		errorCh := make(chan error)
  		files := GetNinjaShardFiles(ninjaFileName)
@@ -902,7 +953,7 @@ index 199171c..85de246 100644
  			wg.Add(1)
  			go func(file string, batchModules []*moduleInfo) {
  				defer wg.Done()
-@@ -4946,19 +5241,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
+@@ -4946,19 +5292,66 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
  			}(file, batchModules)
  			nw.Subninja(file)
  		}
@@ -978,7 +1029,7 @@ index 199171c..85de246 100644
  
  		if c.GetIncrementalEnabled() {
  			wg.Add(1)
-@@ -5039,8 +5381,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
+@@ -5039,8 +5432,11 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
  }
  
  func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
@@ -992,7 +1043,7 @@ index 199171c..85de246 100644
  	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
  	if err != nil {
  		return err
-@@ -5119,8 +5464,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
+@@ -5119,8 +5515,35 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
  
  func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
  	buf := bytes.NewBuffer(nil)
@@ -1029,7 +1080,7 @@ index 199171c..85de246 100644
  			return err
  		}
  	}
-@@ -5270,39 +5642,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
+@@ -5270,39 +5693,17 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
  	c.BeginEvent("deduplicate_order_only_deps")
  	defer c.EndEvent("deduplicate_order_only_deps")
  
@@ -1107,10 +1158,10 @@ index ad27b1f..13d31aa 100644
  		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 diff --git a/incremental_mutation.go b/incremental_mutation.go
 new file mode 100644
-index 0000000..67361e2
+index 0000000..b372cb1
 --- /dev/null
 +++ b/incremental_mutation.go
-@@ -0,0 +1,1903 @@
+@@ -0,0 +1,1908 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -2065,6 +2116,10 @@ index 0000000..67361e2
 +			// (e.g. phony) can drop its cached contribution. cachedUniqueName was set by
 +			// the previous build's generate and is still present on the removed module.
 +			c.incrementalRemovedKeys = append(c.incrementalRemovedKeys, incrementalModuleKey(m))
++			// Keep the detached moduleInfo too: the singleton contribution probe runs
++			// singletons over it (it still has logicModule + providers) and the order-only
++			// dedup checks its emitted order-only deps.
++			c.incrementalRemovedModules = append(c.incrementalRemovedModules, m)
 +		}
 +	}
 +
@@ -2143,6 +2198,7 @@ index 0000000..67361e2
 +	c.orderOnlyDirtyModules = nil
 +	c.incrementalAddedModules = nil
 +	c.incrementalRemovedKeys = nil
++	c.incrementalRemovedModules = nil
 +	// Keep the previous full build's complete liveGlobals so package-variable
 +	// naming (makeUniquePackageNames) is computed over the SAME package set as a
 +	// cold build. Otherwise a warm targeted regenerate rebuilds liveGlobals from
@@ -4664,10 +4720,10 @@ index 0000000..71a60b0
 +}
 diff --git a/incremental_ninja.go b/incremental_ninja.go
 new file mode 100644
-index 0000000..ef46cf6
+index 0000000..017c8e5
 --- /dev/null
 +++ b/incremental_ninja.go
-@@ -0,0 +1,1059 @@
+@@ -0,0 +1,1179 @@
 +// Copyright 2024 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -4702,10 +4758,12 @@ index 0000000..ef46cf6
 +	"io"
 +	"os"
 +	"reflect"
++	"runtime"
 +	"slices"
 +	"strconv"
 +	"strings"
 +	"sync"
++	"text/template"
 +
 +	"github.com/google/blueprint/gobtools"
 +	"github.com/google/blueprint/proptools"
@@ -5325,28 +5383,81 @@ index 0000000..ef46cf6
 +	if err := nw.Subninja(file); err != nil {
 +		return err
 +	}
-+	if c.dirtyModules != nil && !c.singletonsNeedRegen() {
-+		// Resident rebuild keeping singletons: the existing file is byte-exact.
-+		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja\n")
++	if c.dirtyModules != nil && (!c.singletonsNeedRegen() || c.singletonsRestoredAll) {
++		// Resident rebuild keeping every singleton: the existing file is byte-exact. Either
++		// no singleton needed regen (stable module set), or a membership rebuild whose
++		// contribution probe kept every singleton (singletonsRestoredAll) -- both mean
++		// the serialized singletons section is unchanged, so skip serializing it entirely.
 +		return nil
 +	}
-+	// Singletons were regenerated (a membership change re-runs/probes them), but most
-+	// emit byte-identical output -- the contribution probe keeps all but the few a
-+	// change actually surfaces. Serialize into memory and hash; if it matches the
-+	// previous build's singletons subninja (and this is a targeted rebuild), the
-+	// on-disk file is byte-exact, so skip rewriting this large (~40% of manifest) file.
++
++	// Serialize per singleton, reusing the cached block for every singleton the
++	// contribution probe kept (restorableSingletonNames) and re-serializing only the few
++	// that re-ran (e.g. bootstrap). This turns the O(all-singletons) serialize -- the
++	// dominant remaining warm-rebuild cost -- into O(re-ran). On a cold build
++	// restorableSingletonNames is empty, so every block is serialized fresh and the cache
++	// is (re)populated for the next warm rebuild. Each singleton's block is independent
++	// (it begins with its header Comment, which resets the writer's blank-line state), so
++	// concatenating per-block serializations is byte-identical to one monolithic pass.
++	headerTemplate := template.New("singletonHeader")
++	if _, err := headerTemplate.Parse(singletonHeaderTemplate); err != nil {
++		panic(err) // programming error
++	}
++	resident := c.dirtyModules != nil
++	newCache := make(map[string][]byte, len(c.singletonInfo))
++	blocks := make([][]byte, 0, len(c.singletonInfo))
++	changed := false
++	reused := 0
++	for _, info := range c.singletonInfo {
++		var block []byte
++		if resident && c.restorableSingletonNames[info.name] {
++			if cached, ok := c.singletonBlockBytes[info.name]; ok {
++				block = cached // kept singleton: its actionDefs are unchanged -> bytes unchanged
++				reused++
++			}
++		}
++		if block == nil {
++			b, err := c.serializeSingletonBlock(info, headerTemplate)
++			if err != nil {
++				return err
++			}
++			block = b
++			if resident && !bytes.Equal(block, c.singletonBlockBytes[info.name]) {
++				changed = true
++			}
++		}
++		if len(block) == 0 {
++			// Empty singleton emits no block (matches writeAllSingletonActions). If it had
++			// a cached block last build it has now disappeared, which changes the file.
++			if resident && len(c.singletonBlockBytes[info.name]) != 0 {
++				changed = true
++			}
++			continue
++		}
++		newCache[info.name] = block
++		blocks = append(blocks, block)
++	}
++	// A singleton present last build but absent now (or vice versa) changes the file.
++	if resident && len(newCache) != len(c.singletonBlockBytes) {
++		changed = true
++	}
++
++	if resident && !changed {
++		// Every re-serialized block matched its cache and the singleton set is unchanged:
++		// the on-disk file is byte-exact. Skip the write (and the full concatenation).
++		c.singletonBlockBytes = newCache
++		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja (block cache, reused %d/%d)\n", reused, len(blocks))
++		return nil
++	}
++
 +	var bb bytes.Buffer
-+	if err := c.writeAllSingletonActions(newNinjaWriter(&bb)); err != nil {
-+		return err
++	for _, block := range blocks {
++		bb.Write(block)
 +	}
 +	hasher := fnv.New64a()
 +	hasher.Write(bb.Bytes())
-+	sum := hasher.Sum64()
-+	if c.dirtyModules != nil && sum == c.singletonsHash {
-+		fmt.Fprintf(os.Stderr, "soong_build delta write: kept singletons subninja (hash)\n")
-+		return nil
-+	}
-+	c.singletonsHash = sum
++	c.singletonsHash = hasher.Sum64()
++	c.singletonBlockBytes = newCache
 +
 +	f, err := c.fs.OpenFile(JoinPath(c.SrcDir(), file), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
 +	if err != nil {
@@ -5358,6 +5469,42 @@ index 0000000..ef46cf6
 +		return err
 +	}
 +	return out.Flush()
++}
++
++// serializeSingletonBlock serializes a single singleton's subninja block -- its header
++// comment plus its local build actions -- exactly as writeAllSingletonActions emits it,
++// into a fresh buffer. Returns nil for a singleton that emits nothing (matching the skip
++// in writeAllSingletonActions). Because each block starts with a Comment (which resets
++// the ninjaWriter's blank-line state) and ends with a BlankLine, a block serialized in
++// isolation is byte-identical to the same block within the monolithic serialization, so
++// concatenating cached + freshly-serialized blocks reproduces the full file exactly.
++func (c *Context) serializeSingletonBlock(info *singletonInfo, headerTemplate *template.Template) ([]byte, error) {
++	if len(info.actionDefs.variables)+len(info.actionDefs.rules)+len(info.actionDefs.buildDefs) == 0 {
++		return nil, nil
++	}
++	var bb bytes.Buffer
++	nw := newNinjaWriter(&bb)
++	factoryFunc := runtime.FuncForPC(reflect.ValueOf(info.factory).Pointer())
++	var hb bytes.Buffer
++	if err := headerTemplate.Execute(&hb, map[string]interface{}{
++		"name":      info.name,
++		"goFactory": factoryFunc.Name(),
++	}); err != nil {
++		return nil, err
++	}
++	if err := nw.Comment(hb.String()); err != nil {
++		return nil, err
++	}
++	if err := nw.BlankLine(); err != nil {
++		return nil, err
++	}
++	if err := c.writeLocalBuildActions(nw, &info.actionDefs); err != nil {
++		return nil, err
++	}
++	if err := nw.BlankLine(); err != nil {
++		return nil, err
++	}
++	return bb.Bytes(), nil
 +}
 +
 +// PhonysNinjaFile returns the path of the subninja holding the deduplicated
@@ -5380,6 +5527,15 @@ index 0000000..ef46cf6
 +	file := PhonysNinjaFile(ninjaFileName)
 +	if err := nw.Subninja(file); err != nil {
 +		return err
++	}
++
++	// Fast path: the order-only dedup reused last build's result (no genuinely-changed
++	// module contributed an order-only dep), so the phony set -- and therefore this
++	// subninja's serialized bytes -- are byte-identical to the file already on disk.
++	// Skip serializing the whole (~60% of the manifest) section just to hash it.
++	if c.dirtyModules != nil && c.orderOnlyDedupReusable() {
++		fmt.Fprintf(os.Stderr, "soong_build delta write: kept phonys subninja (dedup reused)\n")
++		return nil
 +	}
 +
 +	var bb bytes.Buffer
@@ -5597,10 +5753,23 @@ index 0000000..ef46cf6
 +// correct, and the cached phonys are byte-exact.
 +func (c *Context) orderOnlyDedupReusable() bool {
 +	if c.dirtyModules == nil || c.genuinelyChangedModules == nil ||
-+		c.cachedOrderOnlyPhonys == nil || len(c.incrementalRemovedKeys) != 0 {
++		c.cachedOrderOnlyPhonys == nil {
 +		return false
 +	}
++	// A genuinely-changed or added module that emits an order-only dep can change a key's
++	// use count, so the dedup decision (and the cached phonys) must be recomputed.
 +	for m := range c.genuinelyChangedModules {
++		for _, def := range m.actionDefs.buildDefs {
++			if def.OrderOnlyOriginal.Len() > 0 {
++				return false
++			}
++		}
++	}
++	// Likewise a REMOVED module that emitted an order-only dep drops a use of that key,
++	// which can flip a shared key below the dedup threshold. If no removed module emitted
++	// one, no count changed and the cached phonys are still byte-exact. (incrementalRemoved-
++	// Modules retains last build's actionDefs even though the module is detached.)
++	for _, m := range c.incrementalRemovedModules {
 +		for _, def := range m.actionDefs.buildDefs {
 +			if def.OrderOnlyOriginal.Len() > 0 {
 +				return false
@@ -5725,14 +5894,21 @@ index 0000000..ef46cf6
 +		}
 +	}
 +
-+	return &localBuildActions{buildDefs: phonys}
++	result := &localBuildActions{buildDefs: phonys}
++	// Cache the dedup result on the resident context so a later warm rebuild whose
++	// genuinely-changed modules emit no order-only dep can reuse it via
++	// orderOnlyDedupReusable -- skipping this O(tree) recount + per-module rewrite.
++	// The resident path (not the Stock path) is the one the persistent server takes,
++	// so without this the cache was never populated for a warm rebuild.
++	c.cachedOrderOnlyPhonys = result
++	return result
 +}
 diff --git a/incremental_singleton_probe.go b/incremental_singleton_probe.go
 new file mode 100644
-index 0000000..133fe54
+index 0000000..e9bb6f3
 --- /dev/null
 +++ b/incremental_singleton_probe.go
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,260 @@
 +// Copyright 2025 Google Inc. All rights reserved.
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -5838,14 +6014,19 @@ index 0000000..133fe54
 +// empty and is back-filled from every module (returning a full set so nothing is
 +// wrongly skipped before a baseline exists).
 +func (c *Context) genuinelyChangedProbeSet() []*moduleInfo {
-+	if c.regeneratedModules == nil {
-+		return nil
++	// Initialize these unconditionally so that after this call genuinelyChangedModules is
++	// non-nil even on a pure remove (no regenerated modules) -- orderOnlyDedupReusable and
++	// the delta write key off it being non-nil to mean "the probe ran".
++	if c.genuinelyChangedModules == nil {
++		c.genuinelyChangedModules = make(map[*moduleInfo]bool)
 +	}
 +	if c.residentProviderHashes == nil {
 +		c.residentProviderHashes = make(map[string]uint64)
 +	}
++	if c.regeneratedModules == nil {
++		return nil
++	}
 +	var out []*moduleInfo
-+	c.genuinelyChangedModules = make(map[*moduleInfo]bool)
 +	for m := range c.regeneratedModules {
 +		id := probeIdentity(m)
 +		prev, had := c.residentProviderHashes[id]
